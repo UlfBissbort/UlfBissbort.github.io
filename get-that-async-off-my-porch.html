@@ -645,15 +645,11 @@
     
         /* Fixed theme control; colors inherit from the active document role. */
         .theme-switcher {
-            position: fixed;
-            top: 1rem;
-            right: 1.15rem;
+            position: fixed !important;
+            top: 1rem !important;
+            right: 1.15rem !important;
+            left: auto !important;
             z-index: 100;
-        }
-        /* Ash's reading column is centered on wide screens; keep its control at that column's edge. */
-        html[data-theme="light"] .theme-switcher {
-            position: fixed;
-            right: max(1.15rem, calc((100vw - 782px) / 2));
         }
         .theme-switch {
             display: inline-flex;
