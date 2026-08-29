@@ -781,10 +781,8 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
 <p><span class="zef-image-container"><img src="assets/5fd90de000e0454b5b50c9cc487799c62cfceb6bb9667e3c40705f69b1412808.png" alt="" loading="lazy" decoding="async"><button class="zef-image-copy" type="button" aria-label="Copy image" title="Copy image" onclick="copyZefImage(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></span><br>Gopher in Python&#39;s async hell: mental reenactment by the author.</p>
 <div class="blank-line"></div>
 
-<p>Today&#39;s common wisdom is: &quot;Python is not that great at async programming&quot; and how Go is so much better at it. This seems to be part of common programmer wisdom, at least those who have suffered through enough race conditions, Gil issues, deadlocks, performance problems.</p>
+<p>Today&#39;s common wisdom is: &quot;Python is not that great at async programming&quot; and how Go is so much better at it. This seems to be part of common programmer wisdom, at least those who have suffered through enough race conditions, GIL issues, deadlocks, performance problems.</p>
 <p>I used to think this. This post will be like swearing in the church of the gopher: I will claim that as a language, Python allows for <em>better</em> concurrent and parallel programming than Go does. Hear me out.</p>
-<div class="blank-line"></div>
-
 <p>Go has a lot going for it in the async world. I think it boils down to 3 things that make it great out of the box</p>
 <ul>
 <li>I never have to think about function coloring (i.e. is this a regular function or a coroutine)</li>
@@ -793,7 +791,17 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
 </ul>
 <p>I strongly agree with all of these points. But Go&#39;s sweet spot is building regular backend services for CRUD apps or microservices. Two things I&#39;m not particularly excited about these days. You very quickly grow beyond Go&#39;s sweet spot if you try to build reliable and predictable systems for core infrastructure. Or if you you prefer building flexible libraries rather than microservices in factoring out commonality and complexity.</p>
 <p>I am very much in the first camp these days.</p>
-<p>&quot;But surely you won&#39;t try to tell me that using Python asyncio threading is better&quot; you may be thinking. No, I won&#39;t. I think the default error model baked into asyncio is a design mistake and even switching to a better designed alternative</p>
+<p>&quot;But surely you won&#39;t try to tell me that using Python asyncio threading is better&quot; you may be thinking. No, I won&#39;t. I think the default error model baked into asyncio is a design mistake. Switching to a better designed alternative won&#39;t fix that almost all of Pythons async ecosystem has inherited and built on the flawed foundation.</p>
+<p>So what gives? How can Python out-gopher go?<br>I am not saying that standard Python is better than Go in its regular form But I am saying that on a fundamental language level, Python does allow for a better system under the hood. One that is safer for critical systems, more flexible and in some cases even more performant.</p>
+<p>Well, relying on what is in my opinion Python&#39;s greatest power: it is a Lisp in snake&#39;s clothing. As a language, one can use it as a thin syntactic veneer to wrap around whichever library one is building.</p>
+<p>Let&#39;s lean in and see what we can do.</p>
+<ol>
+<li>get rid of function coloring. If I never have to write an <code>async</code> in my application level code, I will be a happier man</li>
+<li>allow composition of computation built around a data flow paradigm</li>
+<li>embrace distributed systems at the language level: don&#39;t throw in the towel at the OS process and network boundary</li>
+<li>do not use exceptions as control flow constructs - prefer errors as values</li>
+</ol>
+<div class="code-block"><div class="code-block-header"><span>Python</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="python"><code class="language-python">data_source_stream | <span class="hljs-built_in">map</span><span class="code-bracket">(</span>foo<span class="code-bracket">)</span> | <span class="hljs-built_in">filter</span><span class="code-bracket">(</span>bar<span class="code-bracket">)</span> | <span class="hljs-title function_">subscribe</span><span class="code-bracket">(</span>do_something<span class="code-bracket">)</span></code></pre></div>
 
     <script>
 function applyBlogTheme(theme, persist) {
