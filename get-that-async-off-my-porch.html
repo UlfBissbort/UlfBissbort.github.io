@@ -713,7 +713,7 @@ html[data-theme="dark"] h1 { font-family: "-apple-system", "BlinkMacSystemFont",
 html[data-theme="dark"] h2 { font-family: "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "sans-serif"; color: rgb(187 187 187 / 1); font-size: 1.5rem; font-weight: 300; margin-top: 2.5rem; margin-bottom: 1rem; }
 html[data-theme="dark"] h3 { font-family: "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "sans-serif"; color: rgb(187 187 187 / 1); font-size: 1.2rem; font-weight: 300; margin-top: 2.5rem; margin-bottom: 1rem; }
 html[data-theme="dark"] hr { background: linear-gradient(90deg, transparent 0%, rgb(56 56 56 / 1) 22%, rgb(56 56 56 / 1) 78%, transparent 100%); }
-html[data-theme="dark"] a { color: rgb(156 220 254 / 1); text-decoration: underline; }
+html[data-theme="dark"] a { color: rgb(156 220 254 / 1); font-weight: inherit; text-decoration: underline; }
 html[data-theme="dark"] a:hover { text-decoration: underline; }
 html[data-theme="dark"] a:focus-visible { outline: 2px solid rgb(121 168 216 / 1); outline-offset: 2px; }
 html[data-theme="dark"] th, html[data-theme="dark"] td { border-top: 1px solid rgb(34 34 34 / 1); border-bottom: 1px solid rgb(34 34 34 / 1); border-left: 1px solid rgb(34 34 34 / 1); border-right: 1px solid rgb(34 34 34 / 1); padding: 10px 14px; color: rgb(153 153 153 / 1); }
@@ -749,7 +749,7 @@ html[data-theme="light"] h1 { font-family: "Iowan Old Style", "Palatino", "Book 
 html[data-theme="light"] h2 { font-family: "Iowan Old Style", "Palatino", "Book Antiqua", "Georgia", "serif"; color: rgb(48 45 39 / 1); font-size: 1.65rem; font-weight: 400; margin-top: 2.6rem; margin-bottom: 1.1rem; }
 html[data-theme="light"] h3 { font-family: "Iowan Old Style", "Palatino", "Book Antiqua", "Georgia", "serif"; color: rgb(38 36 31 / 1); font-size: 1.21rem; font-weight: 400; margin-top: 2.6rem; margin-bottom: 1.1rem; }
 html[data-theme="light"] hr { background: linear-gradient(90deg, transparent 0%, rgb(145 140 127 / 0.65) 22%, rgb(145 140 127 / 0.65) 78%, transparent 100%); }
-html[data-theme="light"] a { color: rgb(64 60 52 / 1); text-decoration: none; }
+html[data-theme="light"] a { color: rgb(98 89 74 / 1); font-weight: 600; text-decoration: underline; }
 html[data-theme="light"] a:hover { text-decoration: underline; }
 html[data-theme="light"] a:focus-visible { outline: 2px solid rgb(64 60 52 / 1); outline-offset: 2px; }
 html[data-theme="light"] th, html[data-theme="light"] td { border-top: 1px solid rgb(145 140 127 / 0.7); border-bottom: 1px solid rgb(145 140 127 / 0.7); border-left: 1px solid rgb(145 140 127 / 0.22); border-right: 1px solid rgb(145 140 127 / 0.22); padding: 10px 14px; color: rgb(64 60 52 / 1); }
@@ -785,13 +785,13 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
 <p>I used to think this. This post will be like swearing in the church of the gopher: I will claim that as a language, Python allows for <em>better</em> concurrent and parallel programming than Go does. Hear me out.</p>
 <p>Go has a lot going for it in the async world. I think it boils down to 3 things that make it great out of the box</p>
 <ul>
-<li>I never have to think about function coloring (i.e. is this a regular function or a coroutine)</li>
+<li>I never have to think about <a href="https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/">function coloring</a> (i.e. is this a regular function or a coroutine)</li>
 <li>errors as values (vs. exceptions)</li>
 <li>automatic and reasonable scheduling defaults with a runtime under the hood that mostly &quot;just works&quot;</li>
 </ul>
 <p>I strongly agree with all of these points. But Go&#39;s sweet spot is building regular backend services for CRUD apps or microservices. Two things I&#39;m not particularly excited about these days. You very quickly grow beyond Go&#39;s sweet spot if you try to build reliable and predictable systems for core infrastructure. Or if you you prefer building flexible libraries rather than microservices in factoring out commonality and complexity.</p>
 <p>I am very much in the first camp these days.</p>
-<p>&quot;But surely you won&#39;t try to tell me that using Python asyncio threading is better&quot; you may be thinking. No, I won&#39;t. I think the default error model baked into asyncio is a design mistake. Switching to a better designed alternative won&#39;t fix that almost all of Pythons async ecosystem has inherited and built on the flawed foundation.</p>
+<p>&quot;But surely you won&#39;t try to tell me that Python&#39;s asyncio is better,&quot; you may be thinking. No, I won&#39;t. Asyncio&#39;s original—and still widely used—<a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task"><code>create_task()</code></a> and <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.gather"><code>gather()</code></a> APIs do not enforce <a href="https://vorpus.org/blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/">structured concurrency</a>. Trio&#39;s <a href="https://trio.readthedocs.io/en/stable/reference-core.html#nurseries-and-spawning">nurseries</a> make task ownership, cancellation, and error propagation structural. Python 3.11&#39;s <a href="https://docs.python.org/3/library/asyncio-task.html#task-groups"><code>TaskGroup</code></a> has since brought similar guarantees to asyncio, but much of the ecosystem and its established programming style grew around the older model.</p>
 <p>So what gives? How can Python out-gopher go?<br>I am not saying that standard Python is better than Go in its regular form But I am saying that on a fundamental language level, Python does allow for a better system under the hood. One that is safer for critical systems, more flexible and in some cases even more performant.</p>
 <p>Well, relying on what is in my opinion Python&#39;s greatest power: it is a Lisp in snake&#39;s clothing. As a language, one can use it as a thin syntactic veneer to wrap around whichever library one is building.</p>
 <p>Let&#39;s lean in and see what we can do.</p>

@@ -1,0 +1,4 @@
+ET.Blog('🍃-8c4846916e8018b1d869',
+    url='https://ulfbissbort.github.io/',
+    deployment=ET.AutoPush(),
+)
