@@ -650,6 +650,11 @@
             right: 1.15rem;
             z-index: 100;
         }
+        /* Ash's reading column is centered on wide screens; keep its control at that column's edge. */
+        html[data-theme="light"] .theme-switcher {
+            position: fixed;
+            right: max(1.15rem, calc((100vw - 782px) / 2));
+        }
         .theme-switch {
             display: inline-flex;
             align-items: center;
