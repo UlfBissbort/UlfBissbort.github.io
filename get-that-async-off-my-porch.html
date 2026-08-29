@@ -736,6 +736,7 @@ html[data-theme="dark"] .code-block pre::-webkit-scrollbar-track { background: r
 html[data-theme="dark"] .code-block pre::-webkit-scrollbar-thumb { border: 2px solid rgb(17 17 17 / 1); border-radius: 999px; background: rgb(85 89 96 / 1); }
 html[data-theme="dark"] .code-block pre::-webkit-scrollbar-thumb:hover { background: rgb(104 109 117 / 1); }
 html[data-theme="dark"] body :not(pre) > code { font-family: "SF Mono", "Fira Code", "Consolas", "Courier New", "monospace"; background-color: rgb(20 20 20 / 1); padding-inline: 0.5em; border-radius: 6px; font-size: 0.84em; color: rgb(224 224 224 / 1); border: 1px solid rgb(42 42 42 / 1); }
+@media (max-width: 600px) { html[data-theme="dark"] body { padding-inline: 1.5rem; } }
 
 /* Generated from almanac-ash-v1; do not edit as a target stylesheet. */
 html[data-theme="light"] { color-scheme: light; }
@@ -771,6 +772,7 @@ html[data-theme="light"] .code-block pre::-webkit-scrollbar-track { background: 
 html[data-theme="light"] .code-block pre::-webkit-scrollbar-thumb { border: 2px solid rgb(234 231 221 / 1); border-radius: 999px; background: rgb(145 140 127 / 0.7); }
 html[data-theme="light"] .code-block pre::-webkit-scrollbar-thumb:hover { background: rgb(106 101 89 / 0.85); }
 html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", "SF Mono", "Menlo", "Monaco", "Consolas", "Liberation Mono", "monospace"; background-color: rgb(240 238 230 / 1); padding-inline: 0.4em; border-radius: 3px; font-size: 0.84em; color: rgb(38 36 31 / 1); border: 1px solid rgb(145 140 127 / 1); }
+@media (max-width: 600px) { html[data-theme="light"] body { padding-inline: 1.5rem; } }
 </style>
 </head>
 <body>
@@ -791,7 +793,7 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
 </ul>
 <p>I strongly agree with all of these points. But Go&#39;s sweet spot is building regular backend services for CRUD apps or microservices. Two things I&#39;m not particularly excited about these days. You very quickly grow beyond Go&#39;s sweet spot if you try to build reliable and predictable systems for core infrastructure. Or if you you prefer building flexible libraries rather than microservices in factoring out commonality and complexity.</p>
 <p>I am very much in the first camp these days.</p>
-<div class="blank-line"></div>
+<p>&quot;But surely you won&#39;t try to tell me that using Python asyncio threading is better&quot; you may be thinking. No, I won&#39;t. I think the default error model baked into asyncio is a design mistake and even switching to a better designed alternative</p>
 
     <script>
 function applyBlogTheme(theme, persist) {
