@@ -1,6 +1,9 @@
 ET.Blog('🍃-8c4846916e8018b1d869',
     hosting=ET.GitHubPages(url='https://ulfbissbort.github.io/'),
     deployment=ET.AutoPush(remote='origin', branch='main'),
+    graph_policy=ET.GraphPolicy(
+        exclude_path_=['*.html'],
+    ),
     theme_=[
         ET.StyleTheme('🍃-3633c06b2d174dd2041f'),
         ET.StyleTheme('🍃-82c0874f13c798ac2936'),
