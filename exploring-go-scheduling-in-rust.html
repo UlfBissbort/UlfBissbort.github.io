@@ -955,6 +955,11 @@ ctx.x19 = f <span class="hljs-keyword">as</span> <span class="hljs-type">u64</sp
 }</code></pre></div>
 <p>Signal return enters the trampoline on the green thread&#39;s stack. The computation contains no call to it.</p>
 <p>The handler executes on the receiving thread. A different thread can request preemption, as Go&#39;s runtime does, but it does not modify another core&#39;s registers directly. This example uses a process-wide timer with one worker; targeting multiple workers requires thread-directed signals.</p>
+<p>Go makes that distinction explicit. Its <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_unix.go#L368-L391"><code>preemptM</code></a> requests preemption through <code>signalM</code>. On macOS, <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/os_darwin.go#L472-L474"><code>signalM</code></a> is just:</p>
+<div class="code-block"><div class="code-block-header"><span>Go</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="go"><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">signalM</span><span class="hljs-params">(mp *m, sig <span class="hljs-type">int</span>)</span></span> {
+    pthread_kill(pthread(mp.procid), <span class="hljs-type">uint32</span>(sig))
+}</code></pre></div>
+<p><code>m</code> represents an OS thread. Despite its name, <code>pthread_kill</code> sends a signal; SIGURG requests preemption rather than terminating the thread. The target thread handles that request. All Go runtime listings below are also copied verbatim from the Go 1.25.7 source.</p>
 <h2>An interruption is not a function call</h2>
 <p>Setting <code>PC = yield_now</code> directly lets an ordinary Rust function overwrite live caller-saved registers. At an arbitrary instruction, the interrupted code may need all of them.</p>
 <p>Save x0–x18 and the injected return destination before calling Rust, then restore them after resumption. The omitted pairs below cover x4–x17 in both directions:</p>
@@ -1003,21 +1008,46 @@ ctx.x19 = f <span class="hljs-keyword">as</span> <span class="hljs-type">u64</sp
 </tbody></table></div>
 <p>Locks impose another constraint. If A is interrupted while holding an internal library lock and B blocks the OS worker waiting for it, A cannot resume to release it. Register preservation alone cannot prevent this deadlock.</p>
 <h2>What Go adds</h2>
-<p>Go&#39;s monitoring thread requests asynchronous preemption when a goroutine has occupied a processor too long. On supported Unix systems, it sends SIGURG to the target OS thread. The handler checks whether the interrupted location is safe before injecting a call. From Go 1.25.7&#39;s <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_unix.go"><code>doSigPreempt</code></a>:</p>
-<div class="code-block"><div class="code-block-header"><span>Go</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="go"><code class="language-go"><span class="hljs-keyword">if</span> wantAsyncPreempt(gp) {
-    <span class="hljs-keyword">if</span> ok, newpc := isAsyncSafePoint(gp, ctxt.sigpc(), ctxt.sigsp(), ctxt.siglr()); ok {
-        ctxt.pushCall(abi.FuncPCABI0(asyncPreempt), newpc)
+<p>After SIGURG reaches the worker, <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_unix.go#L341-L358"><code>doSigPreempt</code></a> decides whether to inject a call:</p>
+<div class="code-block"><div class="code-block-header"><span>Go</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="go"><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">doSigPreempt</span><span class="hljs-params">(gp *g, ctxt *sigctxt)</span></span> {
+    <span class="hljs-comment">// Check if this G wants to be preempted and is safe to</span>
+    <span class="hljs-comment">// preempt.</span>
+    <span class="hljs-keyword">if</span> wantAsyncPreempt(gp) {
+        <span class="hljs-keyword">if</span> ok, newpc := isAsyncSafePoint(gp, ctxt.sigpc(), ctxt.sigsp(), ctxt.siglr()); ok {
+            <span class="hljs-comment">// Adjust the PC and inject a call to asyncPreempt.</span>
+            ctxt.pushCall(abi.FuncPCABI0(asyncPreempt), newpc)
+        }
+    }
+
+    <span class="hljs-comment">// Acknowledge the preemption.</span>
+    gp.m.preemptGen.Add(<span class="hljs-number">1</span>)
+    gp.m.signalPending.Store(<span class="hljs-number">0</span>)
+
+    <span class="hljs-keyword">if</span> GOOS == <span class="hljs-string">&quot;darwin&quot;</span> || GOOS == <span class="hljs-string">&quot;ios&quot;</span> {
+        pendingPreemptSignals.Add(<span class="hljs-number">-1</span>)
     }
 }</code></pre></div>
-<p><a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt.go"><code>isAsyncSafePoint</code></a> checks runtime state, stack space, and compiler metadata for the interrupted PC. It rejects runtime code and instruction sequences marked unsafe. For restartable sequences, it can adjust the resumption PC. If the safety checks fail, the handler returns without preempting.</p>
-<p>On ARM64, <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_arm64.go"><code>pushCall</code></a> saves the original LR before replacing it—the step missing from our handler. With frame-pointer bookkeeping omitted:</p>
-<div class="code-block"><div class="code-block-header"><span>Go</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="go"><code class="language-go">sp := c.sp() - <span class="hljs-number">16</span>
-c.set_sp(sp)
-*(*<span class="hljs-type">uint64</span>)(unsafe.Pointer(<span class="hljs-type">uintptr</span>(sp))) = c.lr()
-
-c.set_lr(<span class="hljs-type">uint64</span>(resumePC))
-c.set_pc(<span class="hljs-type">uint64</span>(targetPC))</code></pre></div>
-<p>The assembly path entered at <code>asyncPreempt</code> preserves the state needed to resume and transfers into the runtime. Go also retains synchronous preemption checks; signals complement them rather than replacing all cooperation with the compiler.</p>
+<p><code>gp</code> is the goroutine; <code>ctxt</code> wraps the interrupted machine state. <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt.go#L363-L454"><code>isAsyncSafePoint</code></a> checks runtime state, stack space, and compiler metadata for the interrupted PC. It rejects runtime code and instruction sequences marked unsafe. For restartable sequences, it can adjust the resumption PC. If the checks fail, no call is injected, but the request is still acknowledged and <code>signalPending</code> is cleared. Receiving a signal and switching goroutines are separate decisions.</p>
+<p>On ARM64, <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_arm64.go#L91-L107"><code>pushCall</code></a> saves the original LR before replacing it—the step missing from our handler:</p>
+<div class="code-block"><div class="code-block-header"><span>Go</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="go"><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-params">(c *sigctxt)</span></span> pushCall(targetPC, resumePC <span class="hljs-type">uintptr</span>) {
+    <span class="hljs-comment">// Push the LR to stack, as we&#x27;ll clobber it in order to</span>
+    <span class="hljs-comment">// push the call. The function being pushed is responsible</span>
+    <span class="hljs-comment">// for restoring the LR and setting the SP back.</span>
+    <span class="hljs-comment">// This extra space is known to gentraceback.</span>
+    sp := c.sp() - <span class="hljs-number">16</span> <span class="hljs-comment">// SP needs 16-byte alignment</span>
+    c.set_sp(sp)
+    *(*<span class="hljs-type">uint64</span>)(unsafe.Pointer(<span class="hljs-type">uintptr</span>(sp))) = c.lr()
+    <span class="hljs-comment">// Make sure a valid frame pointer is saved on the stack so that the</span>
+    <span class="hljs-comment">// frame pointer checks in adjustframe are happy, if they&#x27;re enabled.</span>
+    <span class="hljs-comment">// This is not actually used for unwinding.</span>
+    *(*<span class="hljs-type">uint64</span>)(unsafe.Pointer(<span class="hljs-type">uintptr</span>(sp - goarch.PtrSize))) = c.r29()
+    <span class="hljs-comment">// Set up PC and LR to pretend the function being signaled</span>
+    <span class="hljs-comment">// calls targetPC at resumePC.</span>
+    c.set_lr(<span class="hljs-type">uint64</span>(resumePC))
+    c.set_pc(<span class="hljs-type">uint64</span>(targetPC))
+}</code></pre></div>
+<p>There are two continuation addresses to preserve: the interrupted PC, where this computation resumes, and the original LR, which the interrupted function may need when it returns. Our handler overwrote the latter. Go puts it on the stack, keeps SP aligned, and records frame-pointer state for the runtime&#39;s stack checks.</p>
+<p>The injected target is <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L6-L85"><code>asyncPreempt</code></a>. Its ARM64 assembly saves <code>NZCV</code> and <code>FPSR</code> at <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L27-L30">lines 27–30</a>, then restores them at <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L64-L67">lines 64–67</a>. Those are the condition flags and floating-point status missing from our trampoline. Its register-save set follows Go&#39;s own ABI; it is not a drop-in implementation for arbitrary Rust code. Go also retains synchronous preemption checks.</p>
 <p>Go&#39;s compiler supplies the safe-point metadata its runtime needs. A signal handler added to a Rust executor has no equivalent information about arbitrary Rust code.</p>
 <h2>Resuming on another worker</h2>
 <p>To move a suspended green thread between workers, put ready threads in a shared <code>Mutex&lt;VecDeque&lt;GreenThread&gt;&gt;</code>. A worker runs one until it yields, then puts it back. Another worker can load its context. This extension uses cooperative yields, separate from signal-based preemption.</p>
@@ -1026,6 +1056,7 @@ c.set_pc(<span class="hljs-type">uint64</span>(targetPC))</code></pre></div>
 <h2>Back to the blocked executor</h2>
 <p>A Rust async executor normally gets control when a poll returns. Go has another route: an external preemption request can cause the executing thread to enter runtime code at a suitable location, preserve its state, and schedule another goroutine before the computation finishes.</p>
 <p>The interrupted thread performs the transfer. Its stack stays allocated; its live register state is saved to memory. Go coordinates that operation with compiler-defined safe points. In an ordinary Rust async service, long-running computations still need explicit scheduling boundaries or a separate compute pool.</p>
+<p>Playing with code like this helps me understand the machinery: push it, see what works, then find where it breaks. This code is highly unsafe, tied to the CPU architecture and the OS ABI, and far from production quality or thoroughly tested. It will not run unchanged on other CPU architectures, and even another ARM64 platform needs its stack and signal conventions checked. Still, some of these mechanisms may turn out to be useful in Zef under more controlled circumstances.</p>
 
     <script>
 function applyBlogTheme(theme, persist) {
