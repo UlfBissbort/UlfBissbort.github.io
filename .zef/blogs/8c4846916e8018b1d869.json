@@ -1,0 +1,34 @@
+{
+  "blog_uid": "🍃-8c4846916e8018b1d869",
+  "compiler_blake3": "b3ebf5863d2dbc6854154589fe2a7ad2b4cd0cbe28dedd784e075ba13110f30f",
+  "managed_files": [
+    {
+      "blake3": "fcc98479d10be724b9815a9a3619ff0fe6ae0da6d76d88abe549511663b92418",
+      "path": "exploring-go-scheduling-in-rust.html"
+    }
+  ],
+  "posts": [
+    {
+      "output": "exploring-go-scheduling-in-rust.html",
+      "output_blake3": "fcc98479d10be724b9815a9a3619ff0fe6ae0da6d76d88abe549511663b92418",
+      "slug": "exploring-go-scheduling-in-rust",
+      "source_blake3": "6b97c4ecf0edadf799c143c6e38016081fd67801a95740a8711320c16ac0b1c5",
+      "uid": "🍃-a979d9f673664325eb98"
+    }
+  ],
+  "schema_version": 1,
+  "themes": [
+    {
+      "mode": "dark",
+      "name": "zef-dark-foundation-v1",
+      "source_blake3": "6b3cbd118f780d6bf11c74044cfef6cd4b0a97fb817df19615e45728183d5c1e",
+      "uid": "🍃-3633c06b2d174dd2041f"
+    },
+    {
+      "mode": "light",
+      "name": "almanac-ash-v1",
+      "source_blake3": "caeb459dbb7d80eba7743959332cf6eb6a7d7adec884c1b35c3088a28f3bb58f",
+      "uid": "🍃-82c0874f13c798ac2936"
+    }
+  ]
+}
