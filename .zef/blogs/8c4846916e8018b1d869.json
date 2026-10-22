@@ -3,16 +3,24 @@
   "compiler_blake3": "b3ebf5863d2dbc6854154589fe2a7ad2b4cd0cbe28dedd784e075ba13110f30f",
   "managed_files": [
     {
-      "blake3": "fcc98479d10be724b9815a9a3619ff0fe6ae0da6d76d88abe549511663b92418",
+      "blake3": "b44b26ba418502a496245f5920325c5ba6150c3dc36f984d85d2d8c64ca9858d",
+      "path": "assets/0f090e7ac1153f148976944445d27c134e131e0ed69a75ec6b80b206abc9a3e2.png"
+    },
+    {
+      "blake3": "3119eda9da78197828313a3a08c62699cc8a5c2f2f7dbdc76cd403fa0d0d8118",
+      "path": "assets/zef-assets.json"
+    },
+    {
+      "blake3": "3378959dc7fbab92aa189fbd058e0710ac17d3eb49e2f80ed55bc316b09a6ccb",
       "path": "exploring-go-scheduling-in-rust.html"
     }
   ],
   "posts": [
     {
       "output": "exploring-go-scheduling-in-rust.html",
-      "output_blake3": "fcc98479d10be724b9815a9a3619ff0fe6ae0da6d76d88abe549511663b92418",
+      "output_blake3": "3378959dc7fbab92aa189fbd058e0710ac17d3eb49e2f80ed55bc316b09a6ccb",
       "slug": "exploring-go-scheduling-in-rust",
-      "source_blake3": "6b97c4ecf0edadf799c143c6e38016081fd67801a95740a8711320c16ac0b1c5",
+      "source_blake3": "635a0a60eb3515d370010c2dbd79686ac593a903cd7521cbbd4f4b84b21395fe",
       "uid": "🍃-a979d9f673664325eb98"
     }
   ],
