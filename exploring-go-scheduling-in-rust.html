@@ -782,7 +782,7 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
 <p>A long-running computation behaves quite differently inside a Go goroutine and a Rust async task. Go can pause the computation and run another goroutine before it finishes. A typical Rust async executor cannot: once a task enters a CPU-heavy function, that worker is occupied until the function returns or the task yields.</p>
 <p>This matters in production. If computations occupy every executor worker, unrelated tasks can stop making progress. A request handler, a timeout, or the task that reports an unhealthy service may all be waiting to run. The operating system still schedules threads normally; it is the executor that cannot schedule its other tasks.</p>
 <p>Go can regain control even inside a loop with no function calls. How does it do that? Where does the code that pauses the computation execute, and what must it save?</p>
-<p>Let&#39;s reproduce the mechanism using unsafe Rust and ARM64 assembly on macOS: save a running function&#39;s state, switch stacks, then use a signal to interrupt a computation that never yields. We&#39;ll compare the resulting code with Go&#39;s runtime.</p>
+<p>Let&#39;s build a small scheduler in Rust and ARM64 assembly on macOS: save a computation&#39;s state, switch stacks, then use a signal to interrupt an assembly loop that never yields. Keeping the interruptible computation small makes its suspension rules explicit. We&#39;ll compare the mechanism with Go&#39;s runtime.</p>
 <h2>The worker is occupied</h2>
 <p>Run a CPU-bound task alongside a timer on one Tokio worker. Enable Tokio&#39;s <code>macros</code>, <code>rt</code>, and <code>time</code> features:</p>
 <div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-keyword">use</span> std::{hint::black_box, time::{Duration, Instant}};
@@ -855,17 +855,16 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
 <h2>Saving a computation</h2>
 <p>To run B on A&#39;s OS thread, leave A&#39;s stack and heap data in place and save its register state to memory. B can then use those registers. Restoring A&#39;s values resumes A with its existing stack. The saved addresses remain specific to this process.</p>
 <p>Start with an explicit call to <code>switch_context</code>. At a call boundary, the compiler already accounts for caller-saved registers being clobbered. Save the callee-saved state, stack pointer, and return address:</p>
-<div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-meta">#[repr(C)]</span>
+<div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-meta">#[repr(C, align(16))]</span>
+<span class="hljs-meta">#[derive(Default)]</span>
 <span class="hljs-keyword">struct</span> <span class="hljs-title class_">Context</span> {
-    x19: <span class="hljs-type">u64</span>, x20: <span class="hljs-type">u64</span>, x21: <span class="hljs-type">u64</span>, x22: <span class="hljs-type">u64</span>, x23: <span class="hljs-type">u64</span>,
-    x24: <span class="hljs-type">u64</span>, x25: <span class="hljs-type">u64</span>, x26: <span class="hljs-type">u64</span>, x27: <span class="hljs-type">u64</span>, x28: <span class="hljs-type">u64</span>,
-    x29: <span class="hljs-type">u64</span>,   <span class="hljs-comment">// frame pointer</span>
-    x30: <span class="hljs-type">u64</span>,   <span class="hljs-comment">// link register</span>
-    sp:  <span class="hljs-type">u64</span>,   <span class="hljs-comment">// stack pointer</span>
-    d8:  <span class="hljs-type">u64</span>, d9:  <span class="hljs-type">u64</span>, d10: <span class="hljs-type">u64</span>, d11: <span class="hljs-type">u64</span>,
-    d12: <span class="hljs-type">u64</span>, d13: <span class="hljs-type">u64</span>, d14: <span class="hljs-type">u64</span>, d15: <span class="hljs-type">u64</span>,
+    x: [<span class="hljs-type">u64</span>; <span class="hljs-number">12</span>], <span class="hljs-comment">// x19–x30, including frame pointer and link register</span>
+    sp: <span class="hljs-type">u64</span>,
+    d: [<span class="hljs-type">u64</span>; <span class="hljs-number">8</span>],  <span class="hljs-comment">// lower 64 bits of v8–v15</span>
+    fpcr: <span class="hljs-type">u64</span>,
+    fpsr: <span class="hljs-type">u64</span>,
 }</code></pre></div>
-<p><code>#[repr(C)]</code> fixes the field layout used by the assembly. The AArch64 calling convention requires preserving the lower 64 bits of d8–d15, even for integer-heavy workloads: the compiler can use those registers too.</p>
+<p><code>#[repr(C, align(16))]</code> fixes the field layout and alignment used by the assembly. The AArch64 calling convention requires preserving the lower 64 bits of v8–v15, even for integer-heavy workloads: the compiler can use those registers too. We also save the floating-point control and status registers, <code>FPCR</code> and <code>FPSR</code>, so tasks can retain distinct FP environments. With alignment padding, this context occupies 192 bytes.</p>
 <p>Store the old context through x0 and load the new one through x1:</p>
 <div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-keyword">use</span> std::arch::naked_asm;
 
@@ -887,6 +886,9 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
         <span class="hljs-string">&quot;stp d10, d11, [x0, #120]&quot;</span>,
         <span class="hljs-string">&quot;stp d12, d13, [x0, #136]&quot;</span>,
         <span class="hljs-string">&quot;stp d14, d15, [x0, #152]&quot;</span>,
+        <span class="hljs-string">&quot;mrs x2, fpcr&quot;</span>,
+        <span class="hljs-string">&quot;mrs x3, fpsr&quot;</span>,
+        <span class="hljs-string">&quot;stp x2, x3, [x0, #168]&quot;</span>,
 
         <span class="hljs-string">&quot;ldp x19, x20, [x1, #0]&quot;</span>,
         <span class="hljs-string">&quot;ldp x21, x22, [x1, #16]&quot;</span>,
@@ -900,6 +902,9 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
         <span class="hljs-string">&quot;ldp d10, d11, [x1, #120]&quot;</span>,
         <span class="hljs-string">&quot;ldp d12, d13, [x1, #136]&quot;</span>,
         <span class="hljs-string">&quot;ldp d14, d15, [x1, #152]&quot;</span>,
+        <span class="hljs-string">&quot;ldp x2, x3, [x1, #168]&quot;</span>,
+        <span class="hljs-string">&quot;msr fpcr, x2&quot;</span>,
+        <span class="hljs-string">&quot;msr fpsr, x3&quot;</span>,
         <span class="hljs-string">&quot;ret&quot;</span>,
     );
 }</code></pre></div>
@@ -907,53 +912,44 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
 <p><code>mov sp, x2</code> installs B&#39;s stack pointer. <code>ret</code> branches to B&#39;s saved x30: usually the instruction after its earlier call to <code>switch_context</code>. That call now returns on B&#39;s stack.</p>
 <p>No second OS thread performs this exchange. The current thread executes the assembly and continues on a different stack. The OS may independently move that thread between physical cores.</p>
 <h2>Starting and yielding</h2>
-<p>For a function that has never run, construct its initial context. Allocate a stack and set the entry address; <code>Context::zeroed()</code> initializes every field to zero:</p>
-<div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-keyword">let</span> <span class="hljs-variable">stack</span> = <span class="hljs-built_in">vec!</span>[<span class="hljs-number">0u8</span>; <span class="hljs-number">64</span> * <span class="hljs-number">1024</span>];
-<span class="hljs-keyword">let</span> <span class="hljs-variable">stack_top</span> = (stack.<span class="hljs-title function_ invoke__">as_ptr</span>() <span class="hljs-keyword">as</span> <span class="hljs-type">u64</span> + stack.<span class="hljs-title function_ invoke__">len</span>() <span class="hljs-keyword">as</span> <span class="hljs-type">u64</span>) &amp; !<span class="hljs-number">0xF</span>;
-
-<span class="hljs-keyword">let</span> <span class="hljs-keyword">mut </span><span class="hljs-variable">ctx</span> = Context::<span class="hljs-title function_ invoke__">zeroed</span>();
-ctx.sp = stack_top;
-ctx.x30 = thread_wrapper <span class="hljs-keyword">as</span> <span class="hljs-type">u64</span>;
-ctx.x19 = f <span class="hljs-keyword">as</span> <span class="hljs-type">u64</span>;</code></pre></div>
-<p>Keep the allocation alive until the green thread finishes. Its stack grows downward from the aligned address, with a fixed 64KB capacity and no guard page. <code>thread_wrapper</code> calls <code>f</code> through x19, then calls <code>thread_done</code> to mark it finished and switch away rather than return past the top of the stack.</p>
-<p>The scheduler runs on the original OS stack as thread 0. It selects a ready green thread and switches into it. To yield, mark the running thread ready and restore thread 0&#39;s context:</p>
-<div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-keyword">fn</span> <span class="hljs-title function_">yield_now</span>() {
-    <span class="hljs-keyword">unsafe</span> {
-        <span class="hljs-keyword">let</span> <span class="hljs-variable">rt</span> = &amp;<span class="hljs-keyword">mut</span> *RT;
-        <span class="hljs-keyword">let</span> <span class="hljs-variable">current</span> = rt.current;
-        rt.threads[current].state = ThreadState::Ready;
-        rt.current = <span class="hljs-number">0</span>;
-
-        <span class="hljs-keyword">let</span> <span class="hljs-variable">cur_ctx</span> = &amp;<span class="hljs-keyword">mut</span> rt.threads[current].ctx <span class="hljs-keyword">as</span> *<span class="hljs-keyword">mut</span> Context;
-        <span class="hljs-keyword">let</span> <span class="hljs-variable">sched_ctx</span> = &amp;rt.threads[<span class="hljs-number">0</span>].ctx <span class="hljs-keyword">as</span> *<span class="hljs-keyword">const</span> Context;
-        <span class="hljs-title function_ invoke__">switch_context</span>(cur_ctx, sched_ctx);
-        <span class="hljs-comment">// The scheduler has selected us again.</span>
-    }
+<p>For a task that has never run, construct its initial context. <code>GuardedStack</code> maps a 64KB usable stack with an inaccessible guard page at each end. The task owns this allocation until it finishes. Its state lives at a stable address in a <code>Box&lt;UnsafeCell&lt;TaskMemory&gt;&gt;</code>; the following excerpt sets the stack pointer, entry address, and task pointer:</p>
+<div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-keyword">let</span> <span class="hljs-variable">stack</span> = GuardedStack::<span class="hljs-title function_ invoke__">new</span>(<span class="hljs-number">64</span> * <span class="hljs-number">1024</span>);
+<span class="hljs-keyword">let</span> <span class="hljs-variable">memory</span> = <span class="hljs-type">Box</span>::<span class="hljs-title function_ invoke__">new</span>(UnsafeCell::<span class="hljs-title function_ invoke__">new</span>(TaskMemory::<span class="hljs-title function_ invoke__">default</span>()));
+<span class="hljs-keyword">let</span> <span class="hljs-variable">p</span> = memory.<span class="hljs-title function_ invoke__">get</span>();
+<span class="hljs-keyword">unsafe</span> {
+    (*p).ctx.sp = stack.<span class="hljs-title function_ invoke__">top</span>();
+    (*p).ctx.x[<span class="hljs-number">0</span>] = p <span class="hljs-keyword">as</span> <span class="hljs-type">u64</span>; <span class="hljs-comment">// x19: task state</span>
+    (*p).ctx.x[<span class="hljs-number">11</span>] = task_entry <span class="hljs-keyword">as</span> *<span class="hljs-title function_ invoke__">const</span> () <span class="hljs-keyword">as</span> <span class="hljs-type">u64</span>; <span class="hljs-comment">// x30: entry address</span>
 }</code></pre></div>
-<p><code>RT</code> is a global runtime pointer. Yielding restores the scheduler&#39;s context instead of calling its loop on the green thread&#39;s stack. The <code>&amp;mut Runtime</code> access requires exclusive ownership across suspension; reentrant access through <code>RT</code> can violate that requirement.</p>
-<p>A function that never calls <code>yield_now</code> still occupies the worker indefinitely.</p>
+<p><code>TaskMemory</code> contains the saved context, workload parameters, results, and the address of the scheduler&#39;s context. <code>task_entry</code> is an assembly entry point: it initializes the computation, calls the assembly loop, then records the results and marks the task finished. It switches back to the scheduler rather than returning past the top of its stack.</p>
+<p>The scheduler runs on the OS stack. Before each dispatch, it gives the task the address of its own saved context and switches into the task:</p>
+<div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-keyword">unsafe</span> {
+    (*p).scheduler = scheduler;
+    <span class="hljs-title function_ invoke__">switch_context</span>(scheduler, std::ptr::addr_of!((*p).ctx));
+    <span class="hljs-comment">// Back on the scheduler&#x27;s stack: the task suspended or finished.</span>
+    (*p).scheduler = std::ptr::<span class="hljs-title function_ invoke__">null_mut</span>();
+}</code></pre></div>
+<p><code>UnsafeCell</code> permits the task&#39;s state to be modified across the assembly boundary. No Rust reference to its mutable contents survives the switch. The scheduler alone owns the task while it runs.</p>
+<p>In cooperative mode, the loop periodically saves its continuation address and enters <code>suspend_task</code>, an assembly trampoline that saves live state and restores the scheduler&#39;s context. The scheduler can then select another task. In non-yielding mode, that path is disabled: the loop makes no calls and checks no preemption flag. Without another way to regain control, the worker stays occupied until the computation finishes.</p>
 <h2>Getting control back</h2>
 <p>Setting a flag from a timer handler does not solve this. A <code>check_preempt()</code> function could read that flag and yield, but the computation would still have to call it.</p>
-<p>Instead, use the signal to redirect execution. Arm a periodic timer with <code>setitimer(ITIMER_REAL, ...)</code> and install a handler with <code>sigaction</code> and <code>SA_SIGINFO</code>. The OS runs the handler on the receiving thread and passes it the saved execution context. Signal return restores that context.</p>
-<p>Change its PC to enter <code>preempt_trampoline</code> rather than resume the loop. Put the interrupted PC in LR as the return destination. This version overwrites the original LR; we&#39;ll address that below. The handler uses the macOS ARM64 offsets directly:</p>
-<div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-keyword">extern</span> <span class="hljs-string">&quot;C&quot;</span> <span class="hljs-keyword">fn</span> <span class="hljs-title function_">preempt_handler</span>(
-    _sig: <span class="hljs-type">i32</span>,
-    _info: *<span class="hljs-keyword">const</span> <span class="hljs-type">u8</span>,
-    ucontext: *<span class="hljs-keyword">mut</span> <span class="hljs-type">u8</span>,
-) {
-    <span class="hljs-keyword">unsafe</span> {
-        <span class="hljs-keyword">if</span> (*RT).current == <span class="hljs-number">0</span> { <span class="hljs-keyword">return</span>; } <span class="hljs-comment">// skip the scheduler</span>
+<p>Instead, use the signal to redirect execution. Arm a periodic timer with <code>setitimer(ITIMER_REAL, ...)</code> and install a handler with <code>sigaction</code>, <code>SA_SIGINFO</code>, and <code>SA_ONSTACK</code>. The OS runs the handler on the receiving thread, using a separate signal stack, and passes it the saved execution context. Signal return restores that context.</p>
+<p>We accept preemption only when the interrupted PC lies between two labels in the computation loop. Inside that range, the code performs arithmetic but makes no Rust calls, acquires no locks, and accesses no thread-local state. The scheduler, library code, and suspension trampoline are outside the range.</p>
+<p>The handler saves the interrupted PC in the task&#39;s <code>resume_pc</code> field and redirects execution to <code>suspend_task</code>. It leaves the original LR intact. Here is the handler&#39;s core, omitting counters; <code>UContext</code> models the native signal context, and the machine-state offsets are specific to macOS ARM64:</p>
+<div class="code-block"><div class="code-block-header"><span>Rust</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="rust"><code class="language-rust"><span class="hljs-keyword">unsafe</span> {
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">mc</span> = (*uc).mcontext;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">pc</span> = mc.<span class="hljs-title function_ invoke__">add</span>(<span class="hljs-number">272</span>).cast::&lt;<span class="hljs-type">u64</span>&gt;();
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">value</span> = *pc <span class="hljs-keyword">as</span> <span class="hljs-type">usize</span>;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">begin</span> = std::ptr::addr_of!(demo_kernel_begin) <span class="hljs-keyword">as</span> <span class="hljs-type">usize</span>;
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">end</span> = std::ptr::addr_of!(demo_kernel_end) <span class="hljs-keyword">as</span> <span class="hljs-type">usize</span>;
+    <span class="hljs-keyword">if</span> value &lt; begin || value &gt;= end { <span class="hljs-keyword">return</span>; }
 
-        <span class="hljs-comment">// macOS ARM64 offsets, obtained from the system headers.</span>
-        <span class="hljs-keyword">let</span> <span class="hljs-variable">mctx</span> = *(ucontext.<span class="hljs-title function_ invoke__">add</span>(<span class="hljs-number">48</span>) <span class="hljs-keyword">as</span> *<span class="hljs-keyword">const</span> *<span class="hljs-keyword">mut</span> <span class="hljs-type">u8</span>);
-        <span class="hljs-keyword">let</span> <span class="hljs-variable">pc</span> = mctx.<span class="hljs-title function_ invoke__">add</span>(<span class="hljs-number">272</span>) <span class="hljs-keyword">as</span> *<span class="hljs-keyword">mut</span> <span class="hljs-type">u64</span>;
-        <span class="hljs-keyword">let</span> <span class="hljs-variable">lr</span> = mctx.<span class="hljs-title function_ invoke__">add</span>(<span class="hljs-number">256</span>) <span class="hljs-keyword">as</span> *<span class="hljs-keyword">mut</span> <span class="hljs-type">u64</span>;
-
-        *lr = *pc; <span class="hljs-comment">// experimental return destination; destroys original LR</span>
-        *pc = preempt_trampoline <span class="hljs-keyword">as</span> <span class="hljs-type">u64</span>;
-    }
+    <span class="hljs-comment">// Within this loop, x19 holds the task-state pointer.</span>
+    <span class="hljs-keyword">let</span> <span class="hljs-variable">task</span> = *(mc.<span class="hljs-title function_ invoke__">add</span>(<span class="hljs-number">16</span> + <span class="hljs-number">19</span> * <span class="hljs-number">8</span>).cast::&lt;*<span class="hljs-keyword">mut</span> TaskMemory&gt;());
+    (*task).resume_pc = *pc;
+    *pc = suspend_task <span class="hljs-keyword">as</span> *<span class="hljs-title function_ invoke__">const</span> () <span class="hljs-keyword">as</span> <span class="hljs-type">u64</span>;
 }</code></pre></div>
-<p>Signal return enters the trampoline on the green thread&#39;s stack. The computation contains no call to it.</p>
+<p>Signal return leaves the handler and its alternate stack before entering the trampoline on the task&#39;s stack. The non-yielding loop contains no call to the trampoline; the signal supplies the transfer. This is asynchronous preemption of an explicitly bounded computation, not arbitrary Rust code.</p>
 <p>The handler executes on the receiving thread. A different thread can request preemption, as Go&#39;s runtime does, but it does not modify another core&#39;s registers directly. This example uses a process-wide timer with one worker; targeting multiple workers requires thread-directed signals.</p>
 <p>Go makes that distinction explicit. Its <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_unix.go#L368-L391"><code>preemptM</code></a> requests preemption through <code>signalM</code>. On macOS, <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/os_darwin.go#L472-L474"><code>signalM</code></a> is just:</p>
 <div class="code-block"><div class="code-block-header"><span>Go</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="go"><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">signalM</span><span class="hljs-params">(mp *m, sig <span class="hljs-type">int</span>)</span></span> {
@@ -961,52 +957,65 @@ ctx.x19 = f <span class="hljs-keyword">as</span> <span class="hljs-type">u64</sp
 }</code></pre></div>
 <p><code>m</code> represents an OS thread. Despite its name, <code>pthread_kill</code> sends a signal; SIGURG requests preemption rather than terminating the thread. The target thread handles that request. All Go runtime listings below are also copied verbatim from the Go 1.25.7 source.</p>
 <h2>An interruption is not a function call</h2>
-<p>Setting <code>PC = yield_now</code> directly lets an ordinary Rust function overwrite live caller-saved registers. At an arbitrary instruction, the interrupted code may need all of them.</p>
-<p>Save x0–x18 and the injected return destination before calling Rust, then restore them after resumption. The omitted pairs below cover x4–x17 in both directions:</p>
-<div class="code-block"><div class="code-block-header"><span>Asm</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="asm"><code class="language-asm">preempt_trampoline:
-    stp x0,  x1,  [sp, #-160]!
-    stp x2,  x3,  [sp, #16]
-    // ... save x4–x17 at offsets 32–128 ...
-    stp x18, x30, [sp, #144]
+<p>Redirecting PC straight into an ordinary Rust function would let that function overwrite live caller-saved registers. The interrupted computation did not make a call and cannot be assumed to have saved them.</p>
+<p>The suspension trampoline saves that state before switching to the scheduler. The listing below abbreviates the repetitive register pairs and omits validation bookkeeping. The named field offsets come from <code>offset_of!</code> in the Rust source:</p>
+<div class="code-block"><div class="code-block-header"><span>Asm</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="asm"><code class="language-asm">suspend_task:
+    sub sp, sp, #928                 // 800-byte frame + 128-byte red zone
+    stp x0, x1, [sp, #0]
+    // ... save x2–x17 at offsets 16–128 ...
+    str x30, [sp, #144]              // original LR
+    mrs x9, nzcv
+    ldr x10, [x19, #resume_pc_offset]
+    stp x9, x10, [sp, #160]          // flags and interrupted PC
+    stp q0, q1, [sp, #192]
+    // ... save q2–q31 at offsets 224–672 ...
 
-    bl yield_now
+    mov x0, x19                     // task context is its first field
+    ldr x1, [x19, #scheduler_offset]
+    bl switch_context
 
-    ldp x18, x30, [sp, #144]
-    // ... restore x4–x17 ...
-    ldp x2,  x3,  [sp, #16]
-    ldp x0,  x1,  [sp], #160
-    ret</code></pre></div>
-<p><code>yield_now</code> saves the cooperative context and restores the scheduler. A&#39;s state is split between the 168-byte context and its stack. Resumption returns through the switch, yield function, and trampoline:</p>
-<div class="code-block"><div class="code-block-header"><span>Text</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="text"><code class="language-text">A's loop → signal handler → signal return → trampoline
-    → yield_now → scheduler → B runs
+    ldp q0, q1, [sp, #192]
+    // ... restore q2–q31 ...
+    ldr x9, [sp, #160]
+    msr nzcv, x9
+    // ... restore x0–x15 ...
+    ldr x17, [sp, #136]
+    ldr x30, [sp, #144]              // restore original LR
+    ldr x16, [sp, #168]              // interrupted PC
+    add sp, sp, #928
+    br x16</code></pre></div>
+<p><code>switch_context</code> preserves x19–x29 and the FP environment while the trampoline preserves the remaining live computation state. The computation reserves x16 for the continuation address; its previous value is not restored. Apple&#39;s platform register x18 is left untouched. These are explicit rules of this small assembly workload, not a transparent suspension mechanism for arbitrary native code.</p>
+<p>A&#39;s saved state is split between its 192-byte context and its stack. The same OS thread executes each step:</p>
+<div class="code-block"><div class="code-block-header"><span>Text</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="text"><code class="language-text">A's loop → signal handler → signal return → suspend_task
+    → switch_context → scheduler → B runs
     → ... scheduler selects A ...
-    → yield_now returns → trampoline restores → A's loop</code></pre></div>
-<p>This trampoline still loses machine state and permits unsafe reentry:</p>
+    → switch_context returns → suspend_task restores → A's loop</code></pre></div>
+<p>Each part of the saved state has a separate purpose:</p>
 <div class="table-wrapper"><table>
 <thead>
 <tr>
-<th>Missing requirement</th>
-<th>How the prototype can fail</th>
+<th>State that must survive</th>
+<th>Why it matters</th>
 </tr>
 </thead>
 <tbody><tr>
-<td>Preserve the original LR</td>
-<td>The handler overwrites it with the interrupted PC. A leaf function may still need the original LR to return.</td>
+<td>Interrupted PC and original LR</td>
+<td>The PC identifies where the computation resumes; LR identifies where its function returns. They are different continuations.</td>
 </tr>
 <tr>
-<td>Preserve flags and full FP/SIMD state</td>
-<td>Interrupt between <code>cmp</code> and <code>b.eq</code>: a changed condition flag can choose the wrong branch. The saved d8–d15 values are not the complete vector state.</td>
+<td>Condition flags (<code>NZCV</code>)</td>
+<td>An interruption between a comparison and a conditional branch must not change the branch&#39;s decision.</td>
 </tr>
 <tr>
-<td>Respect the interrupted stack&#39;s conventions</td>
-<td>The injected frame needs space and must not overwrite live data below SP, including the platform&#39;s red zone.</td>
+<td>Full SIMD state and FP control/status</td>
+<td>A call-boundary save of the lower halves of v8–v15 is not enough for an arbitrary interruption inside the loop.</td>
 </tr>
 <tr>
-<td>Prevent unsafe reentry</td>
-<td>Checking <code>current == 0</code> does not protect every scheduler transition, trampoline instruction, or library critical section.</td>
+<td>Stack contents and red zone</td>
+<td>The injected frame must leave live data below the interrupted SP untouched.</td>
 </tr>
 </tbody></table></div>
-<p>Locks impose another constraint. If A is interrupted while holding an internal library lock and B blocks the OS worker waiting for it, A cannot resume to release it. Register preservation alone cannot prevent this deadlock.</p>
+<p>Register preservation alone does not make library code safe to interrupt. If A is paused inside <code>println!</code>, another task may reenter the same OS thread&#39;s borrowed stdout state. If A holds an internal library lock and B blocks the worker waiting for it, A cannot resume to release it. Restricting preemption to our arithmetic loop excludes those operations.</p>
 <h2>What Go adds</h2>
 <p>After SIGURG reaches the worker, <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_unix.go#L341-L358"><code>doSigPreempt</code></a> decides whether to inject a call:</p>
 <div class="code-block"><div class="code-block-header"><span>Go</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="go"><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">doSigPreempt</span><span class="hljs-params">(gp *g, ctxt *sigctxt)</span></span> {
@@ -1028,7 +1037,7 @@ ctx.x19 = f <span class="hljs-keyword">as</span> <span class="hljs-type">u64</sp
     }
 }</code></pre></div>
 <p><code>gp</code> is the goroutine; <code>ctxt</code> wraps the interrupted machine state. <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt.go#L363-L454"><code>isAsyncSafePoint</code></a> checks runtime state, stack space, and compiler metadata for the interrupted PC. It rejects runtime code and instruction sequences marked unsafe. For restartable sequences, it can adjust the resumption PC. If the checks fail, no call is injected, but the request is still acknowledged and <code>signalPending</code> is cleared. Receiving a signal and switching goroutines are separate decisions.</p>
-<p>On ARM64, <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_arm64.go#L91-L107"><code>pushCall</code></a> saves the original LR before replacing it—the step missing from our handler:</p>
+<p>On ARM64, <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/signal_arm64.go#L91-L107"><code>pushCall</code></a> preserves the two continuation addresses using Go&#39;s injected-call frame layout:</p>
 <div class="code-block"><div class="code-block-header"><span>Go</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="go"><code class="language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-params">(c *sigctxt)</span></span> pushCall(targetPC, resumePC <span class="hljs-type">uintptr</span>) {
     <span class="hljs-comment">// Push the LR to stack, as we&#x27;ll clobber it in order to</span>
     <span class="hljs-comment">// push the call. The function being pushed is responsible</span>
@@ -1046,27 +1055,35 @@ ctx.x19 = f <span class="hljs-keyword">as</span> <span class="hljs-type">u64</sp
     c.set_lr(<span class="hljs-type">uint64</span>(resumePC))
     c.set_pc(<span class="hljs-type">uint64</span>(targetPC))
 }</code></pre></div>
-<p>There are two continuation addresses to preserve: the interrupted PC, where this computation resumes, and the original LR, which the interrupted function may need when it returns. Our handler overwrote the latter. Go puts it on the stack, keeps SP aligned, and records frame-pointer state for the runtime&#39;s stack checks.</p>
-<p>The injected target is <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L6-L85"><code>asyncPreempt</code></a>. Its ARM64 assembly saves <code>NZCV</code> and <code>FPSR</code> at <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L27-L30">lines 27–30</a>, then restores them at <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L64-L67">lines 64–67</a>. Those are the condition flags and floating-point status missing from our trampoline. Its register-save set follows Go&#39;s own ABI; it is not a drop-in implementation for arbitrary Rust code. Go also retains synchronous preemption checks.</p>
-<p>Go&#39;s compiler supplies the safe-point metadata its runtime needs. A signal handler added to a Rust executor has no equivalent information about arbitrary Rust code.</p>
+<p>Our handler stores the interrupted PC in task state and leaves LR for the trampoline to save. Go instead puts the original LR on the stack before setting LR to the resumption PC. It also keeps SP aligned and records frame-pointer state for the runtime&#39;s stack checks.</p>
+<p>The injected target is <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L6-L85"><code>asyncPreempt</code></a>. Its ARM64 assembly saves <code>NZCV</code> and <code>FPSR</code> at <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L27-L30">lines 27–30</a>, then restores them at <a href="https://github.com/golang/go/blob/go1.25.7/src/runtime/preempt_arm64.s#L64-L67">lines 64–67</a>. Its register-save set follows Go&#39;s own ABI; it is not a drop-in implementation for arbitrary Rust code. Go also retains synchronous preemption checks.</p>
+<p>The broader difference is how eligible interruption points are identified. We write and bound a small assembly computation ourselves. Go&#39;s compiler supplies metadata that lets its runtime make that decision throughout supported Go code. Adding a signal handler to a Rust executor does not supply equivalent information about arbitrary Rust code.</p>
 <h2>Resuming on another worker</h2>
-<p>To move a suspended green thread between workers, put ready threads in a shared <code>Mutex&lt;VecDeque&lt;GreenThread&gt;&gt;</code>. A worker runs one until it yields, then puts it back. Another worker can load its context. This extension uses cooperative yields, separate from signal-based preemption.</p>
-<p>OS-thread-local state does not move with the stack. A cached pointer to worker A still points to A after resumption on B. Migration must exclude live thread-affine resources and guards, and worker-local pointers must be reacquired on the new worker. Preserving their old register values is precisely the wrong behavior.</p>
+<p>A suspended computation can resume on another OS worker if that worker can load its context and continue using its stack. In this demo, channels transfer exclusive ownership of the task. Each cooperative yield returns the task to a dispatcher, which sends it to the next worker. Routing it deliberately makes migration observable rather than incidental.</p>
+<p>Only assembly frames migrate. Rust scheduler frames stay on their OS threads, and the receiving worker updates the task&#39;s scheduler pointer before resuming it. The timer is stopped and pending timer signals are drained before these workers start: migration uses cooperative yields, separate from the single-worker preemption experiment.</p>
+<p>OS-thread-local state does not move with the stack. A cached pointer to worker A still points to A after resumption on B. Preserving that old register value would be the wrong behavior. Our computation carries no TLS references, guards, or other thread-affine resources across the transfer.</p>
 <p>Preemption does not require migration: A and B can take turns on the same worker.</p>
+<h2>Checking the demonstration</h2>
+<p>The program runs the same arithmetic in four modes:</p>
+<ul>
+<li><strong>Serial:</strong> each non-yielding task finishes before the scheduler runs the next one.</li>
+<li><strong>Cooperative:</strong> each task suspends after a fixed number of iterations.</li>
+<li><strong>Preemptive:</strong> the timer interrupts the loop without cooperative yields; every task must be interrupted, with a full interleaving round before any task completes.</li>
+<li><strong>Migrating:</strong> cooperative suspensions transfer tasks between OS workers, with exact slice and migration counts checked.</li>
+</ul>
+<p>A clean exit alone is not the test. The program checks each task&#39;s integer and selected SIMD results, FP control/status, restored condition flags, and a live value in the red zone. A workload too short to demonstrate preemption fails the preemption checks rather than claiming success. Run with <code>--trace</code> to see task progress at scheduling boundaries.</p>
+<p>On an M1 Pro, 1,000 fresh processes running the default four-mode demo passed these checks. A separate 50,000-task run on eight workers verified 500,000 migrations. These are empirical results for this bounded workload, not a proof of safety or support for arbitrary Rust tasks.</p>
 <h2>Back to the blocked executor</h2>
 <p>A Rust async executor normally gets control when a poll returns. Go has another route: an external preemption request can cause the executing thread to enter runtime code at a suitable location, preserve its state, and schedule another goroutine before the computation finishes.</p>
-<p>The interrupted thread performs the transfer. Its stack stays allocated; its live register state is saved to memory. Go coordinates that operation with compiler-defined safe points. In an ordinary Rust async service, long-running computations still need explicit scheduling boundaries or a separate compute pool.</p>
-<p>I like playing with code like this. Pushing the limits, seeing what works, then find where it breaks. Clearly this code is nowhere close to sufficiently well tested for production use. But maybe this mechanism may turn out to be useful in Zef some day.</p>
-<div class="blank-line"></div>
-
-<div class="blank-line"></div>
-
-<div class="blank-line"></div>
-
-<div class="blank-line"></div>
+<p>The interrupted thread performs the transfer. Its stack stays allocated; its live register state is saved to memory. Our demo makes the permitted interruption region explicit; Go coordinates the operation with compiler-defined safe points. In an ordinary Rust async service, long-running computations still need explicit scheduling boundaries or a separate compute pool.</p>
+<p>I like playing with code like this: pushing the limits and understanding where they are. This is a bounded demonstration, not a production executor for arbitrary Rust tasks. Whether a mechanism like this could be useful in Zef is an open question.</p>
+<div style="height: 5rem" aria-hidden="true"></div>
 
 <hr>
-<p><strong>Source code:</strong> You can look at <a href="downloads/exploring_go_scheduling_in_rust.rs">source code</a> for this experiment. To compile it, use bare <code>rustc -O exploring_go_scheduling_in_rust.rs -o goroutines</code>.<br>This is only likely to run successfully on MacOS with an ARM processor (I ran it on a Macbook M1 Pro).</p>
+<p><strong>Source code:</strong> <a href="downloads/exploring_go_scheduling_in_rust.rs">View or download the Rust experiment</a>. It requires macOS ARM64 (Apple Silicon) and a recent Rust compiler; I tested it on an M1 Pro. Compile it with bare <code>rustc</code>, then run with <code>--trace</code> to see the scheduling:</p>
+<div class="code-block"><div class="code-block-header"><span>Bash</span><div class="code-block-actions"><button class="code-block-width" type="button" aria-label="Full width" title="Full width" onclick="toggleCodeBlockWidth(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5M2.5 8h11"></path></svg></button><button class="code-block-copy" type="button" aria-label="Copy code" title="Copy code" onclick="copyCodeBlock(this)"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="7.5" height="7.5" rx="1.25"></rect><path d="M10.5 5.25V4.5A1.25 1.25 0 0 0 9.25 3.25H4.5A1.25 1.25 0 0 0 3.25 4.5v4.75A1.25 1.25 0 0 0 4.5 10.5h.75"></path></svg></button></div></div><pre data-lang="bash"><code class="language-bash">rustc -O exploring_go_scheduling_in_rust.rs -o goroutines
+./goroutines --trace</code></pre></div>
+<p>Use <code>./goroutines --help</code> for workload, repetition, and stress-test options.</p>
 
     <script>
 function applyBlogTheme(theme, persist) {

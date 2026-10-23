@@ -1,1482 +1,585 @@
-use std::arch::{asm, naked_asm};
+//! A bounded green-thread experiment, NOT a runtime for arbitrary Rust closures.
+//! Build: rustc -O main.rs -o goroutines (Rust 1.88+; macOS ARM64 only).
+//! Run: ./goroutines --help
+//!
+//! Only the labelled assembly kernel may be asynchronously preempted. It has
+//! no Rust frames, allocations, locks, I/O or TLS access. Migrating tasks also
+//! contain only assembly frames. Scheduler Rust frames stay on their OS thread.
+//! x16 is RESERVED for the resumption PC; x18 is Apple's reserved platform
+//! register and is never modified. This is a deliberate kernel ABI, not a
+//! promise to suspend arbitrary native instructions safely.
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  The Context — What Gets Saved When We Switch
-// ═══════════════════════════════════════════════════════════════════════════════
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+compile_error!("This experiment requires macOS on ARM64 (Apple Silicon).");
 
-/// On AArch64, we save 21 registers:
-///   x19-x28: callee-saved general purpose (10 regs)
-///   x29:     frame pointer
-///   x30:     link register (return address)
-///   sp:      stack pointer
-///   d8-d15:  callee-saved SIMD/FP registers (8 regs, 64-bit each)
-///
-/// The d8-d15 registers MUST be saved! The C calling convention requires
-/// the callee to preserve them. Without this, the compiler can store data
-/// in d8-d15 across our switch_context call, and we'd corrupt it.
-/// This was the root cause of intermittent crashes with multiple OS workers.
-#[repr(C)]
-#[derive(Debug, Clone)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod demo {
+use std::arch::naked_asm;
+use std::cell::UnsafeCell;
+use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::mem::{offset_of, size_of};
+use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Barrier};
+use std::time::Instant;
+
+// At an explicit call boundary, the ABI makes caller-saved registers disposable.
+// FPCR/FPSR are included so our test tasks can use different FP environments.
+#[repr(C, align(16))]
+#[derive(Default)]
 struct Context {
-    x19: u64, x20: u64, x21: u64, x22: u64, x23: u64,
-    x24: u64, x25: u64, x26: u64, x27: u64, x28: u64,
-    x29: u64,   // frame pointer
-    x30: u64,   // link register
-    sp:  u64,   // stack pointer
-    d8:  u64, d9:  u64, d10: u64, d11: u64,
-    d12: u64, d13: u64, d14: u64, d15: u64,
+    x: [u64; 12],                 // x19..x30
+    sp: u64,
+    d: [u64; 8],                  // low 64 bits of v8..v15
+    fpcr: u64,
+    fpsr: u64,
 }
+const _: () = {
+    assert!(size_of::<Context>() == 192);
+    assert!(offset_of!(Context, sp) == 96);
+    assert!(offset_of!(Context, d) == 104);
+    assert!(offset_of!(Context, fpcr) == 168);
+    assert!(offset_of!(Context, fpsr) == 176);
+};
 
-impl Context {
-    const fn zeroed() -> Self {
-        Context {
-            x19: 0, x20: 0, x21: 0, x22: 0, x23: 0,
-            x24: 0, x25: 0, x26: 0, x27: 0, x28: 0,
-            x29: 0, x30: 0, sp: 0,
-            d8: 0, d9: 0, d10: 0, d11: 0,
-            d12: 0, d13: 0, d14: 0, d15: 0,
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  switch_context — The Heart of Green Threading
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Save current registers into `old`, load registers from `new`, return.
-/// After this returns, we're running on the new context's stack with
-/// the new context's registers. The `ret` instruction jumps to whatever
-/// address was in the new context's x30 (link register).
-///
-/// We save both integer callee-saved regs (x19-x28, x29, x30, sp) and
-/// SIMD callee-saved regs (d8-d15). Missing d8-d15 causes intermittent
-/// corruption under concurrent workloads — a painful lesson!
 #[unsafe(naked)]
 unsafe extern "C" fn switch_context(_old: *mut Context, _new: *const Context) {
     naked_asm!(
-        // Save callee-saved integer registers to old context (x0)
-        "stp x19, x20, [x0, #0]",
-        "stp x21, x22, [x0, #16]",
-        "stp x23, x24, [x0, #32]",
-        "stp x25, x26, [x0, #48]",
-        "stp x27, x28, [x0, #64]",
-        "stp x29, x30, [x0, #80]",
-        "mov x2, sp",
-        "str x2, [x0, #96]",
-        // Save callee-saved SIMD registers (d8-d15)
-        "stp d8, d9, [x0, #104]",
-        "stp d10, d11, [x0, #120]",
-        "stp d12, d13, [x0, #136]",
-        "stp d14, d15, [x0, #152]",
-
-        // Load callee-saved integer registers from new context (x1)
-        "ldp x19, x20, [x1, #0]",
-        "ldp x21, x22, [x1, #16]",
-        "ldp x23, x24, [x1, #32]",
-        "ldp x25, x26, [x1, #48]",
-        "ldp x27, x28, [x1, #64]",
-        "ldp x29, x30, [x1, #80]",
-        "ldr x2, [x1, #96]",
-        "mov sp, x2",
-        // Load callee-saved SIMD registers (d8-d15)
-        "ldp d8, d9, [x1, #104]",
-        "ldp d10, d11, [x1, #120]",
-        "ldp d12, d13, [x1, #136]",
-        "ldp d14, d15, [x1, #152]",
-
-        // Return — jumps to address in x30 (the new context's LR)
+        "stp x19, x20, [x0, #0]", "stp x21, x22, [x0, #16]",
+        "stp x23, x24, [x0, #32]", "stp x25, x26, [x0, #48]",
+        "stp x27, x28, [x0, #64]", "stp x29, x30, [x0, #80]",
+        "mov x2, sp", "str x2, [x0, #96]",
+        "stp d8, d9, [x0, #104]", "stp d10, d11, [x0, #120]",
+        "stp d12, d13, [x0, #136]", "stp d14, d15, [x0, #152]",
+        "mrs x2, fpcr", "mrs x3, fpsr", "stp x2, x3, [x0, #168]",
+        "ldp x19, x20, [x1, #0]", "ldp x21, x22, [x1, #16]",
+        "ldp x23, x24, [x1, #32]", "ldp x25, x26, [x1, #48]",
+        "ldp x27, x28, [x1, #64]", "ldp x29, x30, [x1, #80]",
+        "ldr x2, [x1, #96]", "mov sp, x2",
+        "ldp d8, d9, [x1, #104]", "ldp d10, d11, [x1, #120]",
+        "ldp d12, d13, [x1, #136]", "ldp d14, d15, [x1, #152]",
+        "ldp x2, x3, [x1, #168]", "msr fpcr, x2", "msr fpsr, x3",
         "ret",
     );
+}
+
+#[repr(C)]
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Results {
+    count: u64,
+    sum: u64,
+    xor: u64,
+    v0: [u64; 2],
+    v8: [u64; 2],
+    v31: [u64; 2],
+    fpcr: u64,
+    fpsr: u64,
+    red_zone: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct TaskMemory {
+    ctx: Context,                 // MUST be first: also the switch_context pointer
+    scheduler: *mut Context,      // refreshed on every dispatch, including migration
+    resume_pc: u64,               // signal handler / cooperative yield -> trampoline
+    done: u64,
+    iterations: u64,
+    quantum: u64,                 // 0 means no cooperative yield
+    seed: u64,
+    results: Results,
+    preemptions: u64,
+    flag_faults: u64,             // OR of discrepancies observed after restoration
+}
+
+// Entry is reached by switch_context, not by a Rust call. Its only caller frame
+// is assembly. The BL/RET pair deliberately tests preservation of original LR.
+#[unsafe(naked)]
+unsafe extern "C" fn task_entry() {
+    naked_asm!(
+        "mov x0, #0", "ldr x1, [x19, #{seed}]", "mov x2, x1",
+        "ldr x4, [x19, #{iterations}]", "ldr x5, [x19, #{quantum}]",
+        "mov x6, x5",
+        "dup v0.2d, x1", "mov x9, #3", "mul x9, x1, x9", "dup v8.2d, x9",
+        "mov x9, #7", "mul x9, x1, x9", "dup v31.2d, x9",
+        "mov x9, #1", "dup v1.2d, x9",
+        "bl {kernel}",
+        "add x9, x19, #{results}",
+        "stp x0, x1, [x9, #0]", "str x2, [x9, #16]",
+        "str q0, [x9, #24]", "str q8, [x9, #40]", "str q31, [x9, #56]",
+        "mrs x10, fpcr", "mrs x11, fpsr", "stp x10, x11, [x9, #72]",
+        "mov x9, #1", "str x9, [x19, #{done}]",
+        "mov x0, x19", "ldr x1, [x19, #{scheduler}]",
+        "bl {switch}", "brk #1",  // a completed task MUST NOT be resumed
+        kernel = sym compute_kernel,
+        switch = sym switch_context,
+        seed = const offset_of!(TaskMemory, seed),
+        iterations = const offset_of!(TaskMemory, iterations),
+        quantum = const offset_of!(TaskMemory, quantum),
+        results = const offset_of!(TaskMemory, results),
+        done = const offset_of!(TaskMemory, done),
+        scheduler = const offset_of!(TaskMemory, scheduler),
+    );
+}
+
+// Only instructions in [demo_kernel_begin, demo_kernel_end) can be interrupted.
+// In quantum=0 mode there are NO calls, yields, flag polls or syscalls in the loop.
+// Flags are live across CMP/B.HS and SUBS/B.NE. SIMD upper halves are also live.
+#[unsafe(naked)]
+unsafe extern "C" fn compute_kernel() {
+    naked_asm!(
+        // A live red-zone value checks that injected frames leave it alone.
+        "mov x9, #0x5a5a", "stur x9, [sp, #-8]",
+        ".globl _demo_kernel_begin", "_demo_kernel_begin:",
+        "2:", "cmp x0, x4", "b.hs 4f",
+        "add x1, x1, x0", "eor x2, x2, x0", "add x0, x0, #1",
+        "add v0.2d, v0.2d, v1.2d", "add v8.2d, v8.2d, v1.2d",
+        "cbz x5, 2b", "subs x6, x6, #1", "b.ne 2b",
+        // Do not accept asynchronous signals during the cooperative handoff.
+        ".globl _demo_kernel_end", "_demo_kernel_end:",
+        "mov x6, x5", "adr x16, 2b", "str x16, [x19, #{resume}]",
+        "b {suspend}", "4:",
+        "ldur x9, [sp, #-8]", "str x9, [x19, #{red_zone}]", "ret",
+        red_zone = const offset_of!(TaskMemory, results) + offset_of!(Results, red_zone),
+        resume = const offset_of!(TaskMemory, resume_pc),
+        suspend = sym suspend_task,
+    );
+}
+
+// Both cooperative yields and signal-return PC redirection enter here.
+// Leave 128 bytes (Darwin red zone) untouched below the interrupted SP.
+// 800-byte frame: GPRs 0..159, NZCV/PC 160..175, vectors 192..703.
+// x19..x29 and FPCR/FPSR are saved by switch_context; x18 is untouched.
+// x16 is intentionally restored as the continuation PC, NOT its previous value.
+#[unsafe(naked)]
+unsafe extern "C" fn suspend_task() {
+    naked_asm!(
+        "sub sp, sp, #928",
+        "stp x0, x1, [sp, #0]", "stp x2, x3, [sp, #16]",
+        "stp x4, x5, [sp, #32]", "stp x6, x7, [sp, #48]",
+        "stp x8, x9, [sp, #64]", "stp x10, x11, [sp, #80]",
+        "stp x12, x13, [sp, #96]", "stp x14, x15, [sp, #112]",
+        "stp x16, x17, [sp, #128]", "str x30, [sp, #144]",
+        "mrs x9, nzcv", "ldr x10, [x19, #{resume}]", "stp x9, x10, [sp, #160]",
+        "stp q0, q1, [sp, #192]", "stp q2, q3, [sp, #224]",
+        "stp q4, q5, [sp, #256]", "stp q6, q7, [sp, #288]",
+        "stp q8, q9, [sp, #320]", "stp q10, q11, [sp, #352]",
+        "stp q12, q13, [sp, #384]", "stp q14, q15, [sp, #416]",
+        "stp q16, q17, [sp, #448]", "stp q18, q19, [sp, #480]",
+        "stp q20, q21, [sp, #512]", "stp q22, q23, [sp, #544]",
+        "stp q24, q25, [sp, #576]", "stp q26, q27, [sp, #608]",
+        "stp q28, q29, [sp, #640]", "stp q30, q31, [sp, #672]",
+        "mov x0, x19", "ldr x1, [x19, #{scheduler}]", "bl {switch}",
+        "ldp q0, q1, [sp, #192]", "ldp q2, q3, [sp, #224]",
+        "ldp q4, q5, [sp, #256]", "ldp q6, q7, [sp, #288]",
+        "ldp q8, q9, [sp, #320]", "ldp q10, q11, [sp, #352]",
+        "ldp q12, q13, [sp, #384]", "ldp q14, q15, [sp, #416]",
+        "ldp q16, q17, [sp, #448]", "ldp q18, q19, [sp, #480]",
+        "ldp q20, q21, [sp, #512]", "ldp q22, q23, [sp, #544]",
+        "ldp q24, q25, [sp, #576]", "ldp q26, q27, [sp, #608]",
+        "ldp q28, q29, [sp, #640]", "ldp q30, q31, [sp, #672]",
+        "ldr x9, [sp, #160]", "msr nzcv, x9",
+        // Validate flags directly: timer sampling need not hit a flag-sensitive
+        // instruction boundary. These instructions do NOT change NZCV.
+        "mrs x9, nzcv", "ldr x10, [sp, #160]", "eor x9, x9, x10",
+        "ldr x10, [x19, #{flag_faults}]", "orr x9, x9, x10",
+        "str x9, [x19, #{flag_faults}]",
+        "ldp x0, x1, [sp, #0]",  "ldp x2, x3, [sp, #16]",
+        "ldp x4, x5, [sp, #32]", "ldp x6, x7, [sp, #48]",
+        "ldp x8, x9, [sp, #64]", "ldp x10, x11, [sp, #80]",
+        "ldp x12, x13, [sp, #96]", "ldp x14, x15, [sp, #112]",
+        "ldr x17, [sp, #136]", "ldr x30, [sp, #144]",
+        "ldr x16, [sp, #168]", "add sp, sp, #928", "br x16",
+        resume = const offset_of!(TaskMemory, resume_pc),
+        scheduler = const offset_of!(TaskMemory, scheduler),
+        flag_faults = const offset_of!(TaskMemory, flag_faults),
+        switch = sym switch_context,
+    );
+}
+
+// Native declarations: checked against the installed SDK by abi-check.c.
+unsafe extern "C" {
+    static demo_kernel_begin: u8;
+    static demo_kernel_end: u8;
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+    fn munmap(addr: *mut c_void, len: usize) -> i32;
+    fn getpagesize() -> i32;
+    fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+    fn sigaltstack(new: *const SignalStack, old: *mut SignalStack) -> i32;
+    fn sigprocmask(how: i32, set: *const u32, old: *mut u32) -> i32;
+    fn sigpending(set: *mut u32) -> i32;
+    fn sigwait(set: *const u32, sig: *mut i32) -> i32;
+    fn setitimer(which: i32, new: *const Timer, old: *mut Timer) -> i32;
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct Timeval { sec: i64, usec: i32, padding: i32 }
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct Timer { interval: Timeval, value: Timeval }
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct SigAction { handler: usize, mask: u32, flags: i32 }
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct SignalStack { ptr: *mut c_void, size: usize, flags: i32 }
+#[repr(C)]
+struct UContext {
+    onstack: i32, sigmask: u32, stack: SignalStack,
+    link: *mut c_void, mcsize: usize, mcontext: *mut u8,
+}
+const _: () = {
+    assert!(offset_of!(UContext, mcontext) == 48);
+    assert!(size_of::<Timeval>() == 16);
+    assert!(size_of::<SigAction>() == 16);
+    assert!(size_of::<SignalStack>() == 24);
+};
+const SIGALRM: i32 = 14;
+const ALARM_MASK: u32 = 1 << (SIGALRM - 1);
+static SIGNALS: AtomicU64 = AtomicU64::new(0);
+static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn timer_handler(_: i32, _: *mut c_void, uc: *mut UContext) {
+    // No allocation, I/O, locks, references into Runtime, or scheduler calls.
+    // Signal return leaves the handler/alternate stack before switching tasks.
+    unsafe {
+        SIGNALS.fetch_add(1, Ordering::Relaxed);
+        let mc = (*uc).mcontext;
+        let pc = mc.add(272).cast::<u64>();
+        let value = *pc as usize;
+        let begin = ptr::addr_of!(demo_kernel_begin) as usize;
+        let end = ptr::addr_of!(demo_kernel_end) as usize;
+        if value < begin || value >= end { return; }
+        // x19 is a valid TaskMemory pointer ONLY within this labelled kernel.
+        let task = *(mc.add(16 + 19 * 8).cast::<*mut TaskMemory>());
+        (*task).resume_pc = *pc;
+        (*task).preemptions += 1;
+        *pc = suspend_task as *const () as u64;
+        ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct GuardedStack { base: *mut c_void, len: usize, usable: *mut c_void, bytes: usize }
+impl GuardedStack {
+    fn new(bytes: usize) -> Self {
+        unsafe {
+            let page = getpagesize() as usize;
+            assert!(page.is_power_of_two());
+            let bytes = (bytes + page - 1) & !(page - 1);
+            let len = bytes + 2 * page;
+            let base = mmap(ptr::null_mut(), len, 0, 0x1002, -1, 0);
+            assert_ne!(base as isize, -1, "mmap: {}", std::io::Error::last_os_error());
+            let usable = base.cast::<u8>().add(page).cast::<c_void>();
+            if mprotect(usable, bytes, 3) != 0 {
+                let error = std::io::Error::last_os_error();
+                munmap(base, len);
+                panic!("mprotect: {}", error);
+            }
+            Self { base, len, usable, bytes }
+        }
+    }
+    fn top(&self) -> u64 { self.usable as u64 + self.bytes as u64 }
+}
+impl Drop for GuardedStack {
+    fn drop(&mut self) { unsafe { assert_eq!(munmap(self.base, self.len), 0, "munmap"); } }
+}
+
+struct TimerGuard {
+    old_action: SigAction, old_stack: SignalStack, old_mask: u32,
+    _stack: GuardedStack,
+}
+fn check(rc: i32, operation: &str) {
+    assert_eq!(rc, 0, "{operation}: {}", std::io::Error::last_os_error());
+}
+impl TimerGuard {
+    fn start(micros: u64) -> Self {
+        unsafe {
+            let mut old_mask = 0;
+            check(sigprocmask(1, &ALARM_MASK, &mut old_mask), "block SIGALRM");
+            assert_eq!(old_mask & ALARM_MASK, 0, "SIGALRM was already blocked");
+            let mut old_timer = Timer::default();
+            check(setitimer(0, &Timer::default(), &mut old_timer), "inspect timer");
+            assert_eq!(old_timer.value.sec | old_timer.value.usec as i64, 0, "existing ITIMER_REAL timer");
+            let stack = GuardedStack::new(128 * 1024);
+            let new_stack = SignalStack { ptr: stack.usable, size: stack.bytes, flags: 0 };
+            let mut old_stack = SignalStack::default();
+            check(sigaltstack(&new_stack, &mut old_stack), "sigaltstack");
+            let action = SigAction { handler: timer_handler as *const () as usize, mask: ALARM_MASK, flags: 0x0041 };
+            let mut old_action = SigAction::default();
+            check(sigaction(SIGALRM, &action, &mut old_action), "sigaction");
+            SIGNALS.store(0, Ordering::Relaxed);
+            ACCEPTED.store(0, Ordering::Relaxed);
+            let t = Timeval { sec: (micros / 1_000_000) as i64, usec: (micros % 1_000_000) as i32, padding: 0 };
+            check(setitimer(0, &Timer { interval: t, value: t }, ptr::null_mut()), "start timer");
+            check(sigprocmask(3, &old_mask, ptr::null_mut()), "unblock SIGALRM");
+            Self { old_action, old_stack, old_mask, _stack: stack }
+        }
+    }
+}
+impl Drop for TimerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            check(sigprocmask(1, &ALARM_MASK, ptr::null_mut()), "block SIGALRM");
+            check(setitimer(0, &Timer::default(), ptr::null_mut()), "stop timer");
+            // Drain a pending timer signal before restoring its old disposition.
+            let mut pending = 0;
+            check(sigpending(&mut pending), "sigpending");
+            if pending & ALARM_MASK != 0 {
+                let mut sig = 0;
+                check(sigwait(&ALARM_MASK, &mut sig), "sigwait");
+                assert_eq!(sig, SIGALRM);
+            }
+            check(sigaction(SIGALRM, &self.old_action, ptr::null_mut()), "restore action");
+            check(sigaltstack(&self.old_stack, ptr::null_mut()), "restore signal stack");
+            check(sigprocmask(3, &self.old_mask, ptr::null_mut()), "restore signal mask");
+        }
+    }
+}
+
+struct Task {
+    // Stable address: this box and stack may move between owners, not their data.
+    memory: Box<UnsafeCell<TaskMemory>>,
+    _stack: GuardedStack,
+    id: usize,
+    last_worker: Option<usize>,
+    migrations: u64,
+    slices: u64,
+}
+// SAFETY: only one worker owns a Task. Channels transfer exclusive ownership.
+// Its suspended frames are assembly only, with no TLS or thread-affine values.
+// The scheduler pointer is replaced before resuming on a different OS worker.
+unsafe impl Send for Task {}
+impl Task {
+    fn new(id: usize, iterations: u64, quantum: u64) -> Self {
+        let stack = GuardedStack::new(64 * 1024);
+        let memory = Box::new(UnsafeCell::new(TaskMemory::default()));
+        let p = memory.get();
+        unsafe {
+            (*p).ctx.sp = stack.top();
+            (*p).ctx.x[0] = p as u64; // x19
+            (*p).ctx.x[11] = task_entry as *const () as u64; // LR
+            (*p).ctx.fpcr = ((id % 4) as u64) << 22;
+            (*p).ctx.fpsr = (id % 2) as u64 * 16;
+            (*p).iterations = iterations;
+            (*p).quantum = quantum;
+            (*p).seed = id as u64 + 17;
+        }
+        Self { memory, _stack: stack, id, last_worker: None, migrations: 0, slices: 0 }
+    }
+    fn dispatch(&mut self, scheduler: *mut Context, worker: usize) -> bool {
+        if self.last_worker.is_some_and(|last| last != worker) { self.migrations += 1; }
+        self.last_worker = Some(worker);
+        self.slices += 1;
+        // No &TaskMemory or &mut Context survives this call. UnsafeCell covers
+        // modifications by assembly and signal handlers, including at -O/LTO.
+        unsafe {
+            let p = self.memory.get();
+            assert_eq!((*p).done, 0, "resumed a completed task");
+            (*p).scheduler = scheduler;
+            switch_context(scheduler, ptr::addr_of!((*p).ctx));
+            (*p).scheduler = ptr::null_mut();
+            (*p).done == 1
+        }
+    }
+    fn preemptions(&self) -> u64 { unsafe { (*self.memory.get()).preemptions } }
+    fn progress(&self) -> u64 {
+        unsafe {
+            let m = &*self.memory.get();
+            // Suspended SP points to the trampoline frame; its first word is x0.
+            if m.done == 1 { m.results.count } else { *(m.ctx.sp as *const u64) }
+        }
+    }
+    fn verify(&self) {
+        // Task is suspended/finished and exclusively owned here.
+        let m = unsafe { &*self.memory.get() };
+        let n = m.iterations;
+        let seed = m.seed;
+        let sum = ((n as u128 * (n - 1) as u128) / 2) as u64;
+        let k = n - 1;
+        let xor = match k % 4 { 0 => k, 1 => 1, 2 => k + 1, _ => 0 };
+        let expected = Results {
+            count: n, sum: seed.wrapping_add(sum), xor: seed ^ xor,
+            v0: [seed.wrapping_add(n); 2],
+            v8: [seed.wrapping_mul(3).wrapping_add(n); 2],
+            v31: [seed.wrapping_mul(7); 2],
+            fpcr: ((self.id % 4) as u64) << 22,
+            fpsr: (self.id % 2) as u64 * 16,
+            red_zone: 0x5a5a,
+        };
+        assert_eq!(m.done, 1, "task {} incomplete", self.id);
+        assert_eq!(m.flag_faults, 0, "task {} corrupted: NZCV restoration", self.id);
+        assert_eq!(m.results, expected, "task {} corrupted", self.id);
+    }
+}
+
+#[derive(Clone)]
+struct Config {
+    mode: String, iterations: u64, tasks: usize, workers: usize,
+    timer_us: u64, quantum: u64, rounds: usize, trace: bool,
+}
+fn single(c: &Config, mode: &str) {
+    let quantum = if mode == "cooperative" { c.quantum } else { 0 };
+    let mut queue: VecDeque<_> = (0..c.tasks).map(|id| Task::new(id, c.iterations, quantum)).collect();
+    let mut scheduler = Context::default();
+    let mut finished = 0;
+    let mut slices = 0;
+    let mut interrupted_tasks = 0;
+    let mut preemptions = 0;
+    let mut incomplete_before_first_completion = 0;
+    let start = Instant::now();
+    let timer = if mode == "preempt" { Some(TimerGuard::start(c.timer_us)) } else { None };
+    while let Some(mut task) = queue.pop_front() {
+        let done = task.dispatch(&raw mut scheduler, 0);
+        slices += 1;
+        if c.trace && slices <= 32 {
+            println!("  slice={slices} task={} progress={} done={done} preemptions={}", task.id, task.progress(), task.preemptions());
+        }
+        if done {
+            task.verify();
+            let p = task.preemptions();
+            interrupted_tasks += usize::from(p > 0);
+            preemptions += p;
+            finished += 1;
+        } else {
+            if finished == 0 { incomplete_before_first_completion += 1; }
+            queue.push_back(task);
+        }
+    }
+    drop(timer); // stopped/drained before printing or spawning workers
+    assert_eq!(finished, c.tasks);
+    if mode == "preempt" {
+        assert_eq!(interrupted_tasks, c.tasks, "not every task was preempted: increase --iterations or reduce --timer-us");
+        assert_eq!(preemptions, ACCEPTED.load(Ordering::Relaxed));
+        assert_eq!(slices, c.tasks as u64 + preemptions);
+        assert!(incomplete_before_first_completion >= c.tasks, "no complete interleaving round before first completion");
+    } else {
+        assert_eq!(preemptions, 0);
+        if mode == "serial" { assert_eq!(slices, c.tasks as u64); }
+        if mode == "cooperative" {
+            assert_eq!(slices, c.tasks as u64 * (1 + c.iterations / c.quantum));
+        }
+    }
+    println!("PASS mode={mode} tasks={finished} iterations={} slices={slices} preemptions={preemptions} interrupted_tasks={interrupted_tasks} before_first_completion={incomplete_before_first_completion} elapsed_ms={:.3}", c.iterations, start.elapsed().as_secs_f64() * 1000.0);
+}
+
+// A dispatcher transfers exclusive ownership through channels. Round-robin
+// handoff deliberately forces actual migration (rather than hoping a shared
+// queue happens to move tasks). No lock or Rust frame is suspended in a task.
+fn migration(c: &Config) {
+    let (result_tx, result_rx) = mpsc::channel();
+    let barrier = Arc::new(Barrier::new(c.workers + 1));
+    let mut senders = Vec::new();
+    let mut handles = Vec::new();
+    for worker in 0..c.workers {
+        let (tx, rx) = mpsc::channel::<Task>();
+        senders.push(tx);
+        let result_tx = result_tx.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut scheduler = Context::default();
+            barrier.wait();
+            while let Ok(mut task) = rx.recv() {
+                let done = task.dispatch(&raw mut scheduler, worker);
+                if result_tx.send((worker, task, done)).is_err() { break; }
+            }
+        }));
+    }
+    drop(result_tx);
+    let start = Instant::now();
+    barrier.wait();
+    for id in 0..c.tasks {
+        senders[id % c.workers].send(Task::new(id, c.iterations, c.quantum)).unwrap();
+    }
+    let mut completed = 0;
+    let mut migrations = 0;
+    let mut slices = 0;
+    while completed < c.tasks {
+        let (worker, task, done) = result_rx.recv().expect("all workers disappeared");
+        if done {
+            task.verify();
+            assert_eq!(task.preemptions(), 0);
+            let expected_slices = 1 + c.iterations / c.quantum;
+            assert_eq!(task.slices, expected_slices);
+            assert_eq!(task.migrations, if c.workers > 1 { expected_slices - 1 } else { 0 });
+            migrations += task.migrations;
+            slices += task.slices;
+            completed += 1;
+        } else {
+            senders[(worker + 1) % c.workers].send(task).unwrap();
+        }
+    }
+    drop(senders);
+    for h in handles { h.join().expect("worker panicked"); }
+    assert!(c.workers == 1 || migrations > 0, "workload did not demonstrate migration");
+    println!("PASS mode=migrate tasks={completed} workers={} iterations={} slices={slices} migrations={migrations} elapsed_ms={:.3}", c.workers, c.iterations, start.elapsed().as_secs_f64() * 1000.0);
+}
+
+fn config() -> Config {
+    let mut c = Config { mode: "all".into(), iterations: 5_000_000, tasks: 3, workers: 3, timer_us: 1000, quantum: 50_000, rounds: 1, trace: false };
+    let mut args = std::env::args().skip(1);
+    while let Some(key) = args.next() {
+        if key == "--trace" { c.trace = true; continue; }
+        if key == "--help" {
+            println!("Bounded macOS ARM64 green-thread experiment (not an arbitrary Rust runtime)\n\
+Usage: goroutines [--mode all|serial|cooperative|preempt|migrate] [options]\n\
+  --iterations N  loop iterations per task (default 5000000)\n\
+  --tasks N       tasks (default 3)\n\
+  --workers N     migration workers (default 3)\n\
+  --timer-us N    preemption timer interval, microseconds (default 1000)\n\
+  --quantum N     cooperative iterations between yields (default 50000)\n\
+  --rounds N      repeat in this process (default 1)\n\
+  --trace         print the first 32 single-worker scheduling events\n\
+\nAll results are checked. Preempt mode FAILS if every task was not interrupted.\n\
+For 10000-task migration stress: --mode migrate --tasks 10000 --workers 8 --iterations 10000 --quantum 1000\n\
+Use an external timeout for fault experiments. No unsafe negative test runs by default.");
+            std::process::exit(0);
+        }
+        let value = args.next().unwrap_or_else(|| panic!("missing value for {}", key));
+        match key.as_str() {
+            "--mode" => c.mode = value,
+            "--iterations" => c.iterations = value.parse().expect("iterations must be an integer"),
+            "--tasks" => c.tasks = value.parse().expect("tasks must be an integer"),
+            "--workers" => c.workers = value.parse().expect("workers must be an integer"),
+            "--timer-us" => c.timer_us = value.parse().expect("timer-us must be an integer"),
+            "--quantum" => c.quantum = value.parse().expect("quantum must be an integer"),
+            "--rounds" => c.rounds = value.parse().expect("rounds must be an integer"),
+            _ => panic!("unknown option {}; use --help", key),
+        }
+    }
+    assert!(["all", "serial", "cooperative", "preempt", "migrate"].contains(&c.mode.as_str()), "unknown mode");
+    assert!((1..=10_000_000_000).contains(&c.iterations));
+    assert!((1..=100_000).contains(&c.tasks));
+    assert!((1..=64).contains(&c.workers));
+    assert!((1..=1_000_000).contains(&c.timer_us));
+    assert!(c.quantum > 0);
+    assert!((1..=100_000).contains(&c.rounds));
+    c
+}
+
+pub fn run() {
+    let c = config();
+    println!("Bounded kernel demo: macOS ARM64; x16 reserved; no arbitrary Rust preemption");
+    for round in 1..=c.rounds {
+        println!("ROUND {round}/{}", c.rounds);
+        if c.mode == "all" {
+            single(&c, "serial");
+            single(&c, "cooperative");
+            single(&c, "preempt");
+            migration(&c);
+        } else if c.mode == "migrate" {
+            migration(&c);
+        } else {
+            single(&c, &c.mode);
+        }
+    }
+    println!("PASS all requested checks (empirical evidence, not a proof of soundness)");
+}
 }
 
 fn main() {
-    println!("🚀 Minimal Green Thread Runtime");
-    println!("══════════════════════════════════════════════════\n");
-    stage1_basic_switch();
-    stage2_scheduler();
-    stage3_preemption();
-
-    // Stage 4 experiments — incremental, one question at a time
-    exp1_sigalrm_in_tight_loop();
-    exp2_read_ucontext();
-    exp3_modify_pc();
-    exp4_preempt_green_thread();
-    exp5_full_preemption();
-
-    // Stage 5: M:N threading experiments
-    exp6_two_os_threads();
-    exp7_shared_work_queue();
-
-    // Stage 6: Stress tests — push the limits
-    stress_many_goroutines();
-}
-
-// Shared context for Stage 1 (proper runtime in Stage 2)
-static mut MAIN_CTX: Context = Context::zeroed();
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 1: Basic Context Switch
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn stage1_basic_switch() {
-    println!("📋 Stage 1: Raw Context Switch\n");
-
-    // Allocate a stack for our green thread (64 KB)
-    const STACK_SIZE: usize = 64 * 1024;
-    let stack = vec![0u8; STACK_SIZE];
-    let stack_top = stack.as_ptr() as u64 + STACK_SIZE as u64;
-    // Ensure 16-byte alignment (AArch64 requires it)
-    let stack_top = stack_top & !0xF;
-
-    // Set up the green thread's initial context
-    let mut green_ctx = Context::zeroed();
-    green_ctx.sp = stack_top;
-    green_ctx.x30 = green_thread_fn as u64;  // LR = entry point
-    green_ctx.x29 = 0;                        // FP = null (end of frame chain)
-
-    println!("  ➡️  Main: switching to green thread...");
-
-    unsafe {
-        switch_context(&raw mut MAIN_CTX, &green_ctx as *const Context);
-    }
-
-    println!("  ⬅️  Main: back from green thread!\n");
-
-    // Keep stack alive until we're done
-    drop(stack);
-}
-
-extern "C" fn green_thread_fn() {
-    println!("  🟢 Green thread: Hello! Running on my own stack!");
-
-    let sp: u64;
-    unsafe { asm!("mov {}, sp", out(reg) sp); }
-    println!("  🟢 Green thread: SP = {:#x}", sp);
-
-    println!("  🟢 Green thread: switching back to main...");
-
-    unsafe {
-        switch_context(
-            &mut Context::zeroed() as *mut Context,
-            &raw const MAIN_CTX,
-        );
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 2: Multiple Green Threads + Round-Robin Scheduler
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ThreadState {
- Ready, Running, Finished }
-
-const STACK_SIZE: usize = 64 * 1024;
-
-struct GreenThread {
-    id: usize,
-    state: ThreadState,
-    ctx: Context,
-    stack: Vec<u8>,    // owned stack memory
-}
-
-struct Runtime {
-    threads: Vec<GreenThread>,
-    current: usize,     // index of currently running thread
-}
-
-// Global runtime pointer — the scheduler and yield_now need to find it
-static mut RT: *mut Runtime = std::ptr::null_mut();
-
-impl Runtime {
-    fn new() -> Self {
-        // Thread 0 = the main/scheduler thread (uses the OS stack)
-        let main_thread = GreenThread {
-            id: 0,
-            state: ThreadState::Running,
-            ctx: Context::zeroed(),
-            stack: Vec::new(),  // main uses OS stack
-        };
-        Runtime {
-            threads: vec![main_thread],
-            current: 0,
-        }
-    }
-
-    fn spawn(&mut self, f: fn()) {
-        let id = self.threads.len();
-
-        let stack = vec![0u8; STACK_SIZE];
-        let stack_top = stack.as_ptr() as u64 + STACK_SIZE as u64;
-        let stack_top = stack_top & !0xF;  // 16-byte align
-
-        let mut ctx = Context::zeroed();
-        ctx.sp = stack_top;
-        ctx.x30 = thread_wrapper as u64;  // entry point
-        ctx.x19 = f as u64;               // pass function via callee-saved reg
-        ctx.x29 = 0;                       // end of frame chain
-
-        self.threads.push(GreenThread {
-            id,
-            state: ThreadState::Ready,
-            ctx,
-            stack,
-        });
-    }
-
-    fn run(&mut self) {
-        // Scheduler loop: thread 0 is the scheduler, it picks the next ready thread
-        loop {
-            // Find next Ready thread (round-robin, skip thread 0 = scheduler)
-            let n = self.threads.len();
-            let mut next = None;
-            for i in 1..n {
-                let idx = (self.current.max(1) + i - 1) % (n - 1) + 1;
-                if self.threads[idx].state == ThreadState::Ready {
-                    next = Some(idx);
-                    break;
-                }
-            }
-
-            let Some(idx) = next else { break }; // all finished
-
-            self.current = idx;
-            self.threads[idx].state = ThreadState::Running;
-
-            unsafe {
-                let sched_ctx = &mut self.threads[0].ctx as *mut Context;
-                let thread_ctx = &self.threads[idx].ctx as *const Context;
-                switch_context(sched_ctx, thread_ctx);
-            }
-            // Back here = thread yielded or finished
-        }
-    }
-}
-
-/// Called by green threads to voluntarily give up the CPU
-fn yield_now() {
-    unsafe {
-        let rt = &mut *RT;
-        let current = rt.current;
-        rt.threads[current].state = ThreadState::Ready;
-        rt.current = 0;
-
-        // Switch from current thread directly to scheduler (thread 0)
-        let cur_ctx = &mut rt.threads[current].ctx as *mut Context;
-        let sched_ctx = &rt.threads[0].ctx as *const Context;
-        switch_context(cur_ctx, sched_ctx);
-        // When we resume, we're back here
-    }
-}
-
-/// Thread entry wrapper — invoked when a new green thread starts
-#[unsafe(naked)]
-unsafe extern "C" fn thread_wrapper() {
-    naked_asm!(
-        // x19 = function pointer (set in spawn)
-        "blr x19",           // call the user function
-        "bl {done}",         // mark finished + yield
-        "brk #1",            // should never reach here
-        done = sym thread_done,
-    );
-}
-
-extern "C" fn thread_done() {
-    unsafe {
-        let rt = &mut *RT;
-        let current = rt.current;
-        rt.threads[current].state = ThreadState::Finished;
-        rt.current = 0;
-
-        // Switch to scheduler — we'll never come back
-        let cur_ctx = &mut rt.threads[current].ctx as *mut Context;
-        let sched_ctx = &rt.threads[0].ctx as *const Context;
-        switch_context(cur_ctx, sched_ctx);
-    }
-}
-
-fn stage2_scheduler() {
-    println!("📋 Stage 2: Multiple Green Threads + Scheduler\n");
-
-    let mut rt = Runtime::new();
-
-    rt.spawn(|| {
-        for i in 1..=3 {
-            println!("  [thread 1] step {}", i);
-            yield_now();
-        }
-        println!("  [thread 1] done!");
-    });
-
-    rt.spawn(|| {
-        for i in 1..=3 {
-            println!("  [thread 2] step {}", i);
-            yield_now();
-        }
-        println!("  [thread 2] done!");
-    });
-
-    rt.spawn(|| {
-        for i in 1..=3 {
-            println!("  [thread 3] step {}", i);
-            yield_now();
-        }
-        println!("  [thread 3] done!");
-    });
-
-    unsafe { RT = &mut rt as *mut Runtime; }
-
-    println!("  Spawned 3 green threads. Running scheduler...\n");
-    rt.run();
-
-    unsafe { RT = std::ptr::null_mut(); }
-    println!("\n  ✅ All threads completed!\n");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 3: Timer-Based Preemption (Cooperative via SIGALRM)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Go's runtime inserts preemption checks at function prologues and loop
-// back-edges. Here we simulate that: a SIGALRM fires periodically and sets
-// a flag, and threads check it at "safe points" via check_preempt().
-//
-// This is still cooperative — threads must call check_preempt(). But it
-// demonstrates the timer mechanism that Go uses under the hood.
-
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static SHOULD_YIELD: AtomicBool = AtomicBool::new(false);
-
-extern "C" {
-    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
-}
-
-// itimerval for setitimer
-// macOS: tv_sec = __darwin_time_t = long = i64
-//        tv_usec = __darwin_suseconds_t = long = i64 (NOT i32!)
-#[repr(C)]
-struct Timeval {
-    tv_sec: i64,
-    tv_usec: i64,   // was i32 — WRONG on macOS 64-bit!
-}
-
-#[repr(C)]
-struct ITimerval {
-    it_interval: Timeval,
-    it_value: Timeval,
-}
-
-extern "C" {
-    fn setitimer(which: i32, new: *const ITimerval, old: *mut ITimerval) -> i32;
-}
-
-const SIGALRM: i32 = 14;
-const ITIMER_REAL: i32 = 0;
-
-extern "C" fn alarm_handler(_sig: i32) {
-    SHOULD_YIELD.store(true, Ordering::Relaxed);
-}
-
-/// Check if the timer has fired and yield if so.
-/// This is the "preemption safe point" — equivalent to Go's
-/// compiler-inserted preemption checks.
-fn check_preempt() {
-    if SHOULD_YIELD.swap(false, Ordering::Relaxed) {
-        yield_now();
-    }
-}
-
-fn start_timer(interval_us: i64) {
-    unsafe {
-        signal(SIGALRM, alarm_handler);
-        let timer = ITimerval {
-            it_interval: Timeval { tv_sec: 0, tv_usec: interval_us },
-            it_value: Timeval { tv_sec: 0, tv_usec: interval_us },
-        };
-        setitimer(ITIMER_REAL, &timer, std::ptr::null_mut());
-    }
-}
-
-fn stop_timer() {
-    unsafe {
-        let timer = ITimerval {
-            it_interval: Timeval { tv_sec: 0, tv_usec: 0 },
-            it_value: Timeval { tv_sec: 0, tv_usec: 0 },
-        };
-        setitimer(ITIMER_REAL, &timer, std::ptr::null_mut());
-    }
-}
-
-fn stage3_preemption() {
-    println!("📋 Stage 3: Timer-Based Preemption\n");
-
-    let mut rt = Runtime::new();
-
-    // These threads do heavy work and only yield via check_preempt()
-    // — they never call yield_now() directly
-    rt.spawn(|| {
-        let mut total: u64 = 0;
-        for i in 0u64..5_000_000 {
-            total = total.wrapping_add(i);
-            if i % 500_000 == 0 {
-                check_preempt();
-                if i > 0 {
-                    println!("  [thread A] computed to {}M (sum={})", i / 1_000_000, total);
-                }
-            }
-        }
-        println!("  [thread A] done! sum={}", total);
-    });
-
-    rt.spawn(|| {
-        let mut total: u64 = 0;
-        for i in 0u64..5_000_000 {
-            total = total.wrapping_add(i);
-            if i % 500_000 == 0 {
-                check_preempt();
-                if i > 0 {
-                    println!("  [thread B] computed to {}M (sum={})", i / 1_000_000, total);
-                }
-            }
-        }
-        println!("  [thread B] done! sum={}", total);
-    });
-
-    rt.spawn(|| {
-        let mut total: u64 = 0;
-        for i in 0u64..5_000_000 {
-            total = total.wrapping_add(i);
-            if i % 500_000 == 0 {
-                check_preempt();
-                if i > 0 {
-                    println!("  [thread C] computed to {}M (sum={})", i / 1_000_000, total);
-                }
-            }
-        }
-        println!("  [thread C] done! sum={}", total);
-    });
-
-    unsafe { RT = &mut rt as *mut Runtime; }
-
-    println!("  Spawned 3 compute threads. Timer preempting every 1ms...\n");
-    start_timer(1000); // 1000us = 1ms
-    rt.run();
-    stop_timer();
-
-    unsafe { RT = std::ptr::null_mut(); }
-    println!("\n  ✅ All preemptable threads completed!\n");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 4 — Experiment 1: Does SIGALRM fire inside a tight loop?
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Question: If a green thread runs a tight loop with NO yield and NO
-// check_preempt(), will SIGALRM still fire and interrupt it?
-//
-// Setup: Use sigaction with SA_SIGINFO so we can later access ucontext_t.
-// For now, just count how many times the handler fires during a 50M iteration loop.
-
-use std::sync::atomic::AtomicU64;
-
-static ALARM_COUNT: AtomicU64 = AtomicU64::new(0);
-
-// sigaction structures for macOS AArch64
-#[repr(C)]
-struct SigAction {
-    // On macOS: sa_sigaction is the handler (when SA_SIGINFO is set)
-    sa_handler: usize,
-    sa_mask: u32,
-    sa_flags: i32,
-}
-
-extern "C" {
-    fn sigaction(sig: i32, act: *const SigAction, oldact: *mut SigAction) -> i32;
-}
-
-const SA_SIGINFO: i32 = 0x0040;
-
-// Handler with SA_SIGINFO signature: (sig, info, ucontext)
-extern "C" fn exp1_handler(_sig: i32, _info: *const u8, _ucontext: *mut u8) {
-    ALARM_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
-// Simple handler for signal()
-extern "C" fn exp1_simple_handler(_sig: i32) {
-    ALARM_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
-fn exp1_sigalrm_in_tight_loop() {
-    println!("🧪 Exp 1: Does SIGALRM fire?\n");
-
-    extern "C" { fn raise(sig: i32) -> i32; }
-
-    // Test 0: raise() — synchronous delivery ✅
-    unsafe { signal(SIGALRM, exp1_simple_handler); }
-    ALARM_COUNT.store(0, Ordering::Relaxed);
-    unsafe { raise(SIGALRM); }
-    println!("  Test 0 (raise): count={}", ALARM_COUNT.load(Ordering::Relaxed));
-
-    // Test 1: setitimer + sleep ✅
-    unsafe { signal(SIGALRM, exp1_simple_handler); }
-    ALARM_COUNT.store(0, Ordering::Relaxed);
-    let timer = ITimerval {
-        it_interval: Timeval { tv_sec: 0, tv_usec: 1000 }, // 1ms
-        it_value: Timeval { tv_sec: 0, tv_usec: 1000 },
-    };
-    unsafe { setitimer(ITIMER_REAL, &timer, std::ptr::null_mut()); }
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    stop_timer();
-    println!("  Test 1 (setitimer 1ms + 50ms sleep): count={}", ALARM_COUNT.load(Ordering::Relaxed));
-
-    // Test 2: tight loop — does SIGALRM interrupt pure computation?
-    unsafe { signal(SIGALRM, exp1_simple_handler); }
-    ALARM_COUNT.store(0, Ordering::Relaxed);
-    let timer = ITimerval {
-        it_interval: Timeval { tv_sec: 0, tv_usec: 1000 },
-        it_value: Timeval { tv_sec: 0, tv_usec: 1000 },
-    };
-    unsafe { setitimer(ITIMER_REAL, &timer, std::ptr::null_mut()); }
-    let mut total: u64 = 0;
-    for i in 0u64..500_000_000 {
-        total = total.wrapping_add(std::hint::black_box(i));
-    }
-    stop_timer();
-    let count = ALARM_COUNT.load(Ordering::Relaxed);
-    println!("  Test 2 (1ms timer + 500M iters): count={} sum={}", count, total);
-    println!("  ✅ Verdict: SIGALRM fires {} times inside tight loop!\n", count);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 4 — Experiment 2: Can we read PC/SP/LR from ucontext_t?
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Question: When SIGALRM fires with SA_SIGINFO, can we read the interrupted
-// instruction's PC, SP, and LR from the ucontext_t?
-//
-// macOS AArch64 offsets (from offsets.c):
-//   uc_mcontext pointer at offset 48 in ucontext_t
-//   mcontext.__ss.__pc at offset 272
-//   mcontext.__ss.__sp at offset 264
-//   mcontext.__ss.__lr at offset 256
-//   mcontext.__ss.__fp at offset 248
-//   mcontext.__ss.__x[i] at offset 16 + i*8
-
-// Store captured values so we can check them after the handler returns
-static mut CAPTURED_PC: u64 = 0;
-static mut CAPTURED_SP: u64 = 0;
-static mut CAPTURED_LR: u64 = 0;
-
-const UC_MCONTEXT_OFFSET: usize = 48;
-const MC_PC_OFFSET: usize = 272;
-const MC_SP_OFFSET: usize = 264;
-const MC_LR_OFFSET: usize = 256;
-
-extern "C" fn exp2_handler(_sig: i32, _info: *const u8, ucontext: *mut u8) {
-    unsafe {
-        // ucontext -> uc_mcontext (pointer at offset 48)
-        let mctx_ptr = *((ucontext as *const u8).add(UC_MCONTEXT_OFFSET) as *const *const u8);
-        CAPTURED_PC = *(mctx_ptr.add(MC_PC_OFFSET) as *const u64);
-        CAPTURED_SP = *(mctx_ptr.add(MC_SP_OFFSET) as *const u64);
-        CAPTURED_LR = *(mctx_ptr.add(MC_LR_OFFSET) as *const u64);
-    }
-    ALARM_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
-fn exp2_read_ucontext() {
-    println!("🧪 Exp 2: Can we read PC/SP/LR from signal handler?\n");
-
-    // Install SA_SIGINFO handler
-    unsafe {
-        let action = SigAction {
-            sa_handler: exp2_handler as usize,
-            sa_mask: 0,
-            sa_flags: SA_SIGINFO,
-        };
-        sigaction(SIGALRM, &action, std::ptr::null_mut());
-    }
-
-    // Print address of a known function for reference
-    println!("  exp2_work fn addr:    {:#018x}", exp2_work as u64);
-
-    // Start timer and run a tight loop in a known function
-    ALARM_COUNT.store(0, Ordering::Relaxed);
-    let timer = ITimerval {
-        it_interval: Timeval { tv_sec: 0, tv_usec: 5000 }, // 5ms
-        it_value: Timeval { tv_sec: 0, tv_usec: 5000 },
-    };
-    unsafe { setitimer(ITIMER_REAL, &timer, std::ptr::null_mut()); }
-
-    let result = exp2_work();
-
-    stop_timer();
-    let count = ALARM_COUNT.load(Ordering::Relaxed);
-
-    println!("  Signals fired: {}", count);
-    unsafe {
-        println!("  Captured PC:          {:#018x}", CAPTURED_PC);
-        println!("  Captured SP:          {:#018x}", CAPTURED_SP);
-        println!("  Captured LR:          {:#018x}", CAPTURED_LR);
-
-        // Check: is PC in a plausible code range?
-        let pc_near_work = (CAPTURED_PC as i64 - exp2_work as i64).unsigned_abs() < 0x10000;
-        println!("  PC near exp2_work?    {} (delta={})",
-            if pc_near_work { "✅ YES" } else { "❌ NO" },
-            (CAPTURED_PC as i64 - exp2_work as i64));
-    }
-    println!("  Work result: {} (to prevent optimization)\n", result);
-}
-
-#[inline(never)]
-fn exp2_work() -> u64 {
-    let mut total: u64 = 0;
-    for i in 0u64..500_000_000 {
-        total = total.wrapping_add(std::hint::black_box(i));
-    }
-    total
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 4 — Experiment 3: Can we redirect execution by modifying PC?
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Question: If we overwrite PC in ucontext_t to point to a different function,
-// does execution land there when the signal handler returns?
-//
-// Plan: tight loop → SIGALRM → handler overwrites PC → sigreturn resumes at
-// our target function instead of the loop.
-//
-// We use fork() so a crash doesn't kill the main process.
-
-static mut EXP3_REDIRECTED: AtomicBool = AtomicBool::new(false);
-static mut EXP3_TARGET_ADDR: u64 = 0;
-
-extern "C" fn exp3_handler(_sig: i32, _info: *const u8, ucontext: *mut u8) {
-    unsafe {
-        let mctx_ptr = *((ucontext as *const u8).add(UC_MCONTEXT_OFFSET) as *const *mut u8);
-        let pc_ptr = mctx_ptr.add(MC_PC_OFFSET) as *mut u64;
-
-        // Only redirect once
-        if !EXP3_REDIRECTED.swap(true, Ordering::Relaxed) {
-            // Overwrite PC to point to our target function
-            *pc_ptr = EXP3_TARGET_ADDR;
-        }
-    }
-}
-
-extern "C" fn exp3_landing_pad() {
-    // If we get here, the PC redirect worked!
-    // Print evidence and exit the forked child
-    let msg = b"  \xE2\x9C\x85 LANDED! PC redirect worked! Exiting child.\n";
-    unsafe {
-        extern "C" { fn write(fd: i32, buf: *const u8, count: usize) -> isize; }
-        write(1, msg.as_ptr(), msg.len());
-        extern "C" { fn _exit(status: i32) -> !; }
-        _exit(42); // special exit code = success
-    }
-}
-
-fn exp3_modify_pc() {
-    println!("🧪 Exp 3: Can we redirect execution by modifying PC?\n");
-
-    extern "C" {
-        fn fork() -> i32;
-        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-    }
-
-    let pid = unsafe { fork() };
-    if pid == 0 {
-        // --- CHILD PROCESS ---
-        unsafe {
-            EXP3_REDIRECTED = AtomicBool::new(false);
-            EXP3_TARGET_ADDR = exp3_landing_pad as u64;
-        }
-
-        // Install handler
-        unsafe {
-            let action = SigAction {
-                sa_handler: exp3_handler as usize,
-                sa_mask: 0,
-                sa_flags: SA_SIGINFO,
-            };
-            sigaction(SIGALRM, &action, std::ptr::null_mut());
-        }
-
-        // Start timer and enter tight loop
-        let timer = ITimerval {
-            it_interval: Timeval { tv_sec: 0, tv_usec: 5000 },
-            it_value: Timeval { tv_sec: 0, tv_usec: 5000 },
-        };
-        unsafe { setitimer(ITIMER_REAL, &timer, std::ptr::null_mut()); }
-
-        // This loop should be interrupted and PC redirected to landing_pad
-        let mut total: u64 = 0;
-        for i in 0u64..10_000_000_000 {
-            total = total.wrapping_add(std::hint::black_box(i));
-        }
-
-        // Should never reach here if redirect worked
-        unsafe {
-            let msg = b"  \xE2\x9D\x8C Loop completed without redirect\n";
-            extern "C" { fn write(fd: i32, buf: *const u8, count: usize) -> isize; }
-            write(1, msg.as_ptr(), msg.len());
-            extern "C" { fn _exit(status: i32) -> !; }
-            _exit(1);
-        }
-    } else {
-        // --- PARENT PROCESS ---
-        let mut status: i32 = 0;
-        unsafe { waitpid(pid, &mut status, 0); }
-
-        // WIFEXITED: (status & 0x7f) == 0, WEXITSTATUS: (status >> 8) & 0xff
-        let exited = (status & 0x7f) == 0;
-        let exit_code = (status >> 8) & 0xff;
-        let signaled = (status & 0x7f) != 0;
-        let term_sig = status & 0x7f;
-
-        if exited && exit_code == 42 {
-            println!("  Child exited with code 42 = redirect worked! ✅");
-        } else if exited {
-            println!("  Child exited with code {} ❌", exit_code);
-        } else if signaled {
-            println!("  Child killed by signal {} ❌", term_sig);
-        }
-        println!();
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 4 — Experiment 4: Preempt a GREEN THREAD via signal handler
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Simplest approach: signal handler sets PC = yield_now, LR = interrupted PC.
-// sigreturn enters yield_now; when yield_now returns, LR takes us back to
-// the interrupted code. Caller-saved regs (x0-x18) get clobbered, but let's
-// see if the loop still makes progress (compiler often puts loop vars in
-// callee-saved regs for long-lived variables).
-
-static EXP4_PREEMPT_COUNT: AtomicU64 = AtomicU64::new(0);
-
-extern "C" fn exp4_handler(_sig: i32, _info: *const u8, ucontext: *mut u8) {
-    unsafe {
-        let rt = &*RT;
-        if rt.current == 0 { return; } // don't preempt scheduler
-
-        let mctx = *((ucontext as *const u8).add(UC_MCONTEXT_OFFSET) as *const *mut u8);
-        let pc_ptr = mctx.add(MC_PC_OFFSET) as *mut u64;
-        let lr_ptr = mctx.add(MC_LR_OFFSET) as *mut u64;
-
-        // Save interrupted PC into LR so yield_now returns there
-        let interrupted_pc = *pc_ptr;
-        *lr_ptr = interrupted_pc;
-        *pc_ptr = yield_now as u64;
-
-        EXP4_PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn exp4_preempt_green_thread() {
-    println!("🧪 Exp 4: Naive preemption (known to clobber caller-saved regs)\n");
-    println!("  Running in fork() — may crash or corrupt, that's expected.\n");
-
-    // Run in child process because naive preemption clobbers caller-saved
-    // registers and can segfault. Exp 5 fixes this properly.
-    extern "C" {
-        fn fork() -> i32;
-        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-    }
-    let pid = unsafe { fork() };
-    if pid == 0 {
-        // === CHILD ===
-        let mut rt = Runtime::new();
-
-        rt.spawn(|| {
-            let mut count: u64 = 0;
-            loop {
-                count = count.wrapping_add(1);
-                if count % 5_000_000 == 0 {
-                    println!("  [T1] count={}", count);
-                    if count >= 20_000_000 { break; }
-                }
-            }
-            println!("  [T1] done!");
-        });
-
-        rt.spawn(|| {
-            let mut count: u64 = 0;
-            loop {
-                count = count.wrapping_add(1);
-                if count % 5_000_000 == 0 {
-                    println!("  [T2] count={}", count);
-                    if count >= 20_000_000 { break; }
-                }
-            }
-            println!("  [T2] done!");
-        });
-
-        rt.spawn(|| {
-            let mut count: u64 = 0;
-            loop {
-                count = count.wrapping_add(1);
-                if count % 5_000_000 == 0 {
-                    println!("  [T3] count={}", count);
-                    if count >= 20_000_000 { break; }
-                }
-            }
-            println!("  [T3] done!");
-        });
-
-        unsafe { RT = &mut rt as *mut Runtime; }
-
-        unsafe {
-            let action = SigAction {
-                sa_handler: exp4_handler as usize,
-                sa_mask: 0,
-                sa_flags: SA_SIGINFO,
-            };
-            sigaction(SIGALRM, &action, std::ptr::null_mut());
-        }
-
-        println!("  3 threads, NO yield calls. Timer preempts every 1ms.\n");
-
-        let timer = ITimerval {
-            it_interval: Timeval { tv_sec: 0, tv_usec: 1000 },
-            it_value: Timeval { tv_sec: 0, tv_usec: 1000 },
-        };
-        unsafe { setitimer(ITIMER_REAL, &timer, std::ptr::null_mut()); }
-
-        rt.run();
-
-        stop_timer();
-        let preempts = EXP4_PREEMPT_COUNT.load(Ordering::Relaxed);
-        println!("\n  Preemptions: {}", preempts);
-        println!("  Threads ran (with corrupted counts — expected!)");
-        extern "C" { fn _exit(status: i32) -> !; }
-        unsafe { _exit(0); }
-    } else {
-        // === PARENT ===
-        let mut status: i32 = 0;
-        unsafe { waitpid(pid, &mut status, 0); }
-        if status == 0 {
-            println!("  ✅ Exp 4 child completed (counts may be wrong — that's the lesson)!\n");
-        } else {
-            println!("  ⚠️  Exp 4 child exited with status {} (crash expected — Exp 5 fixes this)\n", status);
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 4 — Experiment 5: Full register save/restore preemption
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Exp 4 proved preemption works but clobbers caller-saved regs. Exp 5 fixes
-// this with a naked trampoline that pushes x0-x18 + LR to the stack before
-// calling yield_now, and pops them after resuming.
-//
-// The flow:
-//   SIGALRM → handler sets PC=trampoline, LR=interrupted_PC
-//   → sigreturn restores all regs (including x0-x18!) + jumps to trampoline
-//   → trampoline pushes x0-x18 + LR to stack
-//   → trampoline calls yield_now → switch_context → scheduler
-//   → ...later, scheduler resumes this thread...
-//   → switch_context returns → yield_now returns → back in trampoline
-//   → trampoline pops x0-x18 + LR
-//   → ret → jumps to LR = interrupted PC with ALL registers intact!
-
-static EXP5_PREEMPT_COUNT: AtomicU64 = AtomicU64::new(0);
-
-extern "C" fn exp5_handler(_sig: i32, _info: *const u8, ucontext: *mut u8) {
-    unsafe {
-        let rt = &*RT;
-        if rt.current == 0 { return; } // don't preempt scheduler
-
-        let mctx = *((ucontext as *const u8).add(UC_MCONTEXT_OFFSET) as *const *mut u8);
-        let pc_ptr = mctx.add(MC_PC_OFFSET) as *mut u64;
-        let lr_ptr = mctx.add(MC_LR_OFFSET) as *mut u64;
-
-        let interrupted_pc = *pc_ptr;
-        *lr_ptr = interrupted_pc;           // LR = where to resume
-        *pc_ptr = preempt_trampoline as u64; // PC = our trampoline
-
-        EXP5_PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Naked trampoline: saves ALL caller-saved registers, yields, restores, returns.
-/// Entered with: LR = interrupted PC, x0-x28 = interrupted values, SP = green thread stack.
-#[unsafe(naked)]
-unsafe extern "C" fn preempt_trampoline() {
-    naked_asm!(
-        // Push 20 regs: x0-x18 + LR (x30). 20 * 8 = 160 bytes, 16-byte aligned ✅
-        "stp x0,  x1,  [sp, #-160]!",
-        "stp x2,  x3,  [sp, #16]",
-        "stp x4,  x5,  [sp, #32]",
-        "stp x6,  x7,  [sp, #48]",
-        "stp x8,  x9,  [sp, #64]",
-        "stp x10, x11, [sp, #80]",
-        "stp x12, x13, [sp, #96]",
-        "stp x14, x15, [sp, #112]",
-        "stp x16, x17, [sp, #128]",
-        "stp x18, x30, [sp, #144]",
-
-        // Call yield_now — this switches to the scheduler.
-        // Callee-saved regs (x19-x28, FP) are preserved through switch_context.
-        // When this thread is resumed, we return here.
-        "bl  {yield_now}",
-
-        // Restore caller-saved regs + LR
-        "ldp x18, x30, [sp, #144]",
-        "ldp x16, x17, [sp, #128]",
-        "ldp x14, x15, [sp, #112]",
-        "ldp x12, x13, [sp, #96]",
-        "ldp x10, x11, [sp, #80]",
-        "ldp x8,  x9,  [sp, #64]",
-        "ldp x6,  x7,  [sp, #48]",
-        "ldp x4,  x5,  [sp, #32]",
-        "ldp x2,  x3,  [sp, #16]",
-        "ldp x0,  x1,  [sp], #160",
-
-        // Return to interrupted PC (in LR)
-        "ret",
-        yield_now = sym yield_now,
-    );
-}
-
-fn exp5_full_preemption() {
-    println!("🧪 Exp 5: Full preemption with register preservation\n");
-
-    let mut rt = Runtime::new();
-
-    // Tight loops counting to exactly 20M — if regs are preserved,
-    // count should reach exactly 20M (not some corrupted huge number)
-    rt.spawn(|| {
-        let mut count: u64 = 0;
-        loop {
-            count += 1;
-            if count % 5_000_000 == 0 {
-                println!("  [T1] count={}", count);
-            }
-            if count >= 20_000_000 { break; }
-        }
-        println!("  [T1] done! final count={} (expected 20000000)", count);
-    });
-
-    rt.spawn(|| {
-        let mut count: u64 = 0;
-        loop {
-            count += 1;
-            if count % 5_000_000 == 0 {
-                println!("  [T2] count={}", count);
-            }
-            if count >= 20_000_000 { break; }
-        }
-        println!("  [T2] done! final count={} (expected 20000000)", count);
-    });
-
-    rt.spawn(|| {
-        let mut count: u64 = 0;
-        loop {
-            count += 1;
-            if count % 5_000_000 == 0 {
-                println!("  [T3] count={}", count);
-            }
-            if count >= 20_000_000 { break; }
-        }
-        println!("  [T3] done! final count={} (expected 20000000)", count);
-    });
-
-    unsafe { RT = &mut rt as *mut Runtime; }
-
-    // Install handler
-    unsafe {
-        let action = SigAction {
-            sa_handler: exp5_handler as usize,
-            sa_mask: 0,
-            sa_flags: SA_SIGINFO,
-        };
-        sigaction(SIGALRM, &action, std::ptr::null_mut());
-    }
-
-    println!("  3 threads counting to 20M, NO yield calls. Timer every 1ms.\n");
-
-    let timer = ITimerval {
-        it_interval: Timeval { tv_sec: 0, tv_usec: 1000 },
-        it_value: Timeval { tv_sec: 0, tv_usec: 1000 },
-    };
-    unsafe { setitimer(ITIMER_REAL, &timer, std::ptr::null_mut()); }
-
-    rt.run();
-
-    stop_timer();
-    let preempts = EXP5_PREEMPT_COUNT.load(Ordering::Relaxed);
-    unsafe { RT = std::ptr::null_mut(); }
-    println!("\n  Total preemptions: {}", preempts);
-    println!("  ✅ Full preemption with correct register preservation!\n");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 5 — M:N Threading: Multiple Goroutines on Multiple OS Threads
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Goal: run M green threads across N OS threads. Each OS thread has its own
-// scheduler. Green threads yield/finish using a thread-local RT pointer.
-//
-// We keep the existing global `RT` for stages 1-4 and add a thread-local
-// `THREAD_RT` for the M:N code. Zero changes to existing code.
-
-use std::cell::Cell;
-
-thread_local! {
-    static THREAD_RT: Cell<*mut Runtime> = const { Cell::new(std::ptr::null_mut()) };
-}
-
-/// yield_now for M:N mode — reads RT from thread-local storage
-fn yield_local() {
-    THREAD_RT.with(|cell| {
-        let rt = unsafe { &mut *cell.get() };
-        let current = rt.current;
-        rt.threads[current].state = ThreadState::Ready;
-        rt.current = 0;
-        let cur_ctx = &mut rt.threads[current].ctx as *mut Context;
-        let sched_ctx = &rt.threads[0].ctx as *const Context;
-        unsafe { switch_context(cur_ctx, sched_ctx); }
-    });
-}
-
-extern "C" fn thread_done_local() {
-    THREAD_RT.with(|cell| {
-        let rt = unsafe { &mut *cell.get() };
-        let current = rt.current;
-        rt.threads[current].state = ThreadState::Finished;
-        rt.current = 0;
-        let cur_ctx = &mut rt.threads[current].ctx as *mut Context;
-        let sched_ctx = &rt.threads[0].ctx as *const Context;
-        unsafe { switch_context(cur_ctx, sched_ctx); }
-    });
-}
-
-#[unsafe(naked)]
-unsafe extern "C" fn thread_wrapper_local() {
-    naked_asm!(
-        "blr x19",
-        "bl {done}",
-        "brk #1",
-        done = sym thread_done_local,
-    );
-}
-
-impl Runtime {
-    fn spawn_local(&mut self, f: fn()) {
-        let id = self.threads.len();
-        let stack = vec![0u8; STACK_SIZE];
-        let stack_top = stack.as_ptr() as u64 + STACK_SIZE as u64;
-        let stack_top = stack_top & !0xF;
-
-        let mut ctx = Context::zeroed();
-        ctx.sp = stack_top;
-        ctx.x30 = thread_wrapper_local as u64;
-        ctx.x19 = f as u64;
-        ctx.x29 = 0;
-
-        self.threads.push(GreenThread { id, state: ThreadState::Ready, ctx, stack });
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Experiment 6: Two OS threads, each with their own green thread scheduler
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn exp6_two_os_threads() {
-    println!("🧪 Exp 6: M:N — Two OS threads, each scheduling green threads\n");
-
-    extern "C" { fn pthread_self() -> u64; }
-
-    let os_tid_main = unsafe { pthread_self() };
-    println!("  Main OS thread: {:#x}", os_tid_main);
-
-    // OS Thread A: runs green threads G1, G2
-    let handle_a = std::thread::spawn(|| {
-        let os_tid = unsafe { pthread_self() };
-        println!("  OS Thread A ({:#x}): starting scheduler", os_tid);
-
-        let mut rt = Runtime::new();
-
-        rt.spawn_local(|| {
-            let tid = unsafe { pthread_self() };
-            for i in 1..=3 {
-                println!("    [A-G1 on {:#x}] step {}", tid, i);
-                yield_local();
-            }
-            println!("    [A-G1] done!");
-        });
-
-        rt.spawn_local(|| {
-            let tid = unsafe { pthread_self() };
-            for i in 1..=3 {
-                println!("    [A-G2 on {:#x}] step {}", tid, i);
-                yield_local();
-            }
-            println!("    [A-G2] done!");
-        });
-
-        THREAD_RT.with(|cell| cell.set(&mut rt as *mut Runtime));
-        rt.run();
-        THREAD_RT.with(|cell| cell.set(std::ptr::null_mut()));
-
-        println!("  OS Thread A: all green threads done");
-    });
-
-    // OS Thread B: runs green threads G3, G4, G5
-    let handle_b = std::thread::spawn(|| {
-        let os_tid = unsafe { pthread_self() };
-        println!("  OS Thread B ({:#x}): starting scheduler", os_tid);
-
-        let mut rt = Runtime::new();
-
-        rt.spawn_local(|| {
-            let tid = unsafe { pthread_self() };
-            for i in 1..=3 {
-                println!("    [B-G3 on {:#x}] step {}", tid, i);
-                yield_local();
-            }
-            println!("    [B-G3] done!");
-        });
-
-        rt.spawn_local(|| {
-            let tid = unsafe { pthread_self() };
-            for i in 1..=3 {
-                println!("    [B-G4 on {:#x}] step {}", tid, i);
-                yield_local();
-            }
-            println!("    [B-G4] done!");
-        });
-
-        rt.spawn_local(|| {
-            let tid = unsafe { pthread_self() };
-            for i in 1..=3 {
-                println!("    [B-G5 on {:#x}] step {}", tid, i);
-                yield_local();
-            }
-            println!("    [B-G5] done!");
-        });
-
-        THREAD_RT.with(|cell| cell.set(&mut rt as *mut Runtime));
-        rt.run();
-        THREAD_RT.with(|cell| cell.set(std::ptr::null_mut()));
-
-        println!("  OS Thread B: all green threads done");
-    });
-
-    handle_a.join().unwrap();
-    handle_b.join().unwrap();
-
-    println!("\n  ✅ M:N scheduling: 5 green threads on 2 OS threads!\n");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Experiment 7: Shared Work Queue — Green threads migrate between OS threads
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// This is the key Go insight: goroutines aren't pinned to an OS thread.
-// A shared queue lets any worker pick up any green thread. After yielding,
-// a green thread might resume on a DIFFERENT OS thread.
-
-use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
-
-struct Worker {
-    sched_ctx: Context,
-}
-
-thread_local! {
-    static WORKER_PTR: Cell<*mut Worker> = const { Cell::new(std::ptr::null_mut()) };
-    // Store the current green thread while it's running
-    static CURRENT_GT: Cell<*mut GreenThread> = const { Cell::new(std::ptr::null_mut()) };
-}
-
-#[inline(never)]
-fn yield_worker() {
-    WORKER_PTR.with(|wcell| {
-        CURRENT_GT.with(|gcell| {
-            let worker_ptr = wcell.get();
-            let gt_ptr = gcell.get();
-            // Use raw pointers only — creating &mut through CURRENT_GT would alias
-            // with worker_loop's &mut gt, which is UB. The optimizer can (and does!)
-            // miscompile this under -O.
-            unsafe {
-                std::ptr::write_volatile(&raw mut (*gt_ptr).state, ThreadState::Ready);
-                switch_context(&raw mut (*gt_ptr).ctx, &raw const (*worker_ptr).sched_ctx);
-            }
-        });
-    });
-}
-
-#[inline(never)]
-extern "C" fn thread_done_worker() {
-    WORKER_PTR.with(|wcell| {
-        CURRENT_GT.with(|gcell| {
-            let worker_ptr = wcell.get();
-            let gt_ptr = gcell.get();
-            // Same raw-pointer discipline as yield_worker — no &mut references.
-            unsafe {
-                std::ptr::write_volatile(&raw mut (*gt_ptr).state, ThreadState::Finished);
-                switch_context(&raw mut (*gt_ptr).ctx, &raw const (*worker_ptr).sched_ctx);
-            }
-        });
-    });
-}
-
-#[unsafe(naked)]
-unsafe extern "C" fn thread_wrapper_worker() {
-    naked_asm!(
-        "blr x19",
-        "bl {done}",
-        "brk #1",
-        done = sym thread_done_worker,
-    );
-}
-
-fn make_green_thread(id: usize, f: fn()) -> GreenThread {
-    let stack = vec![0u8; STACK_SIZE];
-    let stack_top = stack.as_ptr() as u64 + STACK_SIZE as u64;
-    let stack_top = stack_top & !0xF;
-
-    let mut ctx = Context::zeroed();
-    ctx.sp = stack_top;
-    ctx.x30 = thread_wrapper_worker as u64;
-    ctx.x19 = f as u64;
-    ctx.x29 = 0;
-
-    GreenThread { id, state: ThreadState::Ready, ctx, stack }
-}
-
-fn worker_loop(
-    worker_id: usize,
-    queue: &Arc<Mutex<VecDeque<GreenThread>>>,
-    active: &AtomicU64,
-) {
-    extern "C" { fn pthread_self() -> u64; }
-    let os_tid = unsafe { pthread_self() };
-
-    let mut worker = Worker { sched_ctx: Context::zeroed() };
-    let worker_ptr: *mut Worker = &raw mut worker;
-    WORKER_PTR.with(|cell| cell.set(worker_ptr));
-
-    let mut ran = 0u64;
-    let mut spins = 0u64;
-    loop {
-        // Pop + increment active atomically under the lock
-        let gt = {
-            let mut q = queue.lock().unwrap();
-            let gt = q.pop_front();
-            if gt.is_some() {
-                active.fetch_add(1, Ordering::SeqCst);
-            }
-            gt
-        };
-
-        let Some(mut gt) = gt else {
-            if active.load(Ordering::SeqCst) == 0 { break; }
-            spins += 1;
-            std::thread::yield_now();
-            continue;
-        };
-        spins = 0;
-
-        // All access through raw pointers to avoid aliasing UB with
-        // yield_worker/thread_done_worker which access through CURRENT_GT/WORKER_PTR.
-        let gt_ptr: *mut GreenThread = &raw mut gt;
-        unsafe { std::ptr::write_volatile(&raw mut (*gt_ptr).state, ThreadState::Running); }
-
-        CURRENT_GT.with(|cell| cell.set(gt_ptr));
-
-        // Switch to the green thread — all through raw pointers
-        unsafe {
-            switch_context(
-                &raw mut (*worker_ptr).sched_ctx,
-                &raw const (*gt_ptr).ctx,
-            );
-        }
-
-        // Back: thread yielded or finished
-        ran += 1;
-        let state = unsafe { std::ptr::read_volatile(&raw const (*gt_ptr).state as *const ThreadState) };
-        if state == ThreadState::Ready {
-            queue.lock().unwrap().push_back(gt);
-        }
-        // If Finished: gt is dropped here
-        active.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    println!("    Worker {} (OS {:#x}): ran {} time-slices", worker_id, os_tid, ran);
-}
-
-fn exp7_shared_work_queue() {
-    println!("🧪 Exp 7: Shared work queue — green threads migrate between OS threads\n");
-
-    let queue: Arc<Mutex<VecDeque<GreenThread>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let active = Arc::new(AtomicU64::new(0));
-
-    // Create 6 green threads, all in the shared queue
-    {
-        let mut q = queue.lock().unwrap();
-        for i in 1..=6 {
-            q.push_back(make_green_thread(i, match i {
-                1 => gt_work_1 as fn(),
-                2 => gt_work_2,
-                3 => gt_work_3,
-                4 => gt_work_4,
-                5 => gt_work_5,
-                _ => gt_work_6,
-            }));
-        }
-    }
-
-    println!("  6 green threads in shared queue, 3 OS worker threads.\n");
-
-    // Spawn 3 OS worker threads
-    let mut handles = vec![];
-    for w in 0..3 {
-        let q = queue.clone();
-        let a = active.clone();
-        handles.push(std::thread::spawn(move || {
-            worker_loop(w, &q, &a);
-        }));
-    }
-
-    for h in handles { h.join().unwrap(); }
-
-    println!("\n  ✅ Shared work queue: 6 green threads migrated across 3 OS workers!\n");
-}
-
-// Green thread work functions — they print which OS thread they run on each step
-// Include some actual work to spread load across workers
-fn gt_work_1() {
-    extern "C" { fn pthread_self() -> u64; }
-    for i in 1..=4 {
-        let mut v = 0u64;
-        for j in 0..1_000_000 { v = v.wrapping_add(std::hint::black_box(j)); }
-        println!("    [G1 on w{:04x}] step {} (v={})", (unsafe { pthread_self() } >> 12) & 0xFFF, i, v);
-        yield_worker();
-    }
-    println!("    [G1] done!");
-}
-fn gt_work_2() {
-    extern "C" { fn pthread_self() -> u64; }
-    for i in 1..=4 {
-        let mut v = 0u64;
-        for j in 0..1_000_000 { v = v.wrapping_add(std::hint::black_box(j)); }
-        println!("    [G2 on w{:04x}] step {} (v={})", (unsafe { pthread_self() } >> 12) & 0xFFF, i, v);
-        yield_worker();
-    }
-    println!("    [G2] done!");
-}
-fn gt_work_3() {
-    extern "C" { fn pthread_self() -> u64; }
-    for i in 1..=4 {
-        let mut v = 0u64;
-        for j in 0..1_000_000 { v = v.wrapping_add(std::hint::black_box(j)); }
-        println!("    [G3 on w{:04x}] step {} (v={})", (unsafe { pthread_self() } >> 12) & 0xFFF, i, v);
-        yield_worker();
-    }
-    println!("    [G3] done!");
-}
-fn gt_work_4() {
-    extern "C" { fn pthread_self() -> u64; }
-    for i in 1..=4 {
-        let mut v = 0u64;
-        for j in 0..1_000_000 { v = v.wrapping_add(std::hint::black_box(j)); }
-        println!("    [G4 on w{:04x}] step {} (v={})", (unsafe { pthread_self() } >> 12) & 0xFFF, i, v);
-        yield_worker();
-    }
-    println!("    [G4] done!");
-}
-fn gt_work_5() {
-    extern "C" { fn pthread_self() -> u64; }
-    for i in 1..=4 {
-        let mut v = 0u64;
-        for j in 0..1_000_000 { v = v.wrapping_add(std::hint::black_box(j)); }
-        println!("    [G5 on w{:04x}] step {} (v={})", (unsafe { pthread_self() } >> 12) & 0xFFF, i, v);
-        yield_worker();
-    }
-    println!("    [G5] done!");
-}
-fn gt_work_6() {
-    extern "C" { fn pthread_self() -> u64; }
-    for i in 1..=4 {
-        let mut v = 0u64;
-        for j in 0..1_000_000 { v = v.wrapping_add(std::hint::black_box(j)); }
-        println!("    [G6 on w{:04x}] step {} (v={})", (unsafe { pthread_self() } >> 12) & 0xFFF, i, v);
-        yield_worker();
-    }
-    println!("    [G6] done!");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Stage 6: Stress Tests — Push the Limits
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// A shared counter to verify all goroutines ran to completion
-static STRESS_DONE: AtomicU64 = AtomicU64::new(0);
-
-fn stress_work() {
-    // Each goroutine: do some work, yield a few times, increment counter
-    for _ in 0..3 {
-        let mut v = 0u64;
-        for j in 0..100_000 { v = v.wrapping_add(std::hint::black_box(j)); }
-        std::hint::black_box(v);
-        yield_worker();
-    }
-    STRESS_DONE.fetch_add(1, Ordering::SeqCst);
-}
-
-fn stress_many_goroutines() {
-    println!("🏋️ Stress Test: 10000 goroutines on 8 OS threads\n");
-
-    STRESS_DONE.store(0, Ordering::SeqCst);
-
-    let num_goroutines = 10_000;
-    let num_workers = 8;
-
-    let queue: Arc<Mutex<VecDeque<GreenThread>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let active = Arc::new(AtomicU64::new(0));
-
-    // Create all goroutines
-    {
-        let mut q = queue.lock().unwrap();
-        for i in 0..num_goroutines {
-            q.push_back(make_green_thread(i, stress_work as fn()));
-        }
-    }
-
-    println!("  {} goroutines queued, {} OS worker threads.", num_goroutines, num_workers);
-
-    let start = std::time::Instant::now();
-
-    // Spawn workers
-    let mut handles = vec![];
-    for w in 0..num_workers {
-        let q = queue.clone();
-        let a = active.clone();
-        handles.push(std::thread::spawn(move || {
-            worker_loop(w, &q, &a);
-        }));
-    }
-
-    for h in handles { h.join().unwrap(); }
-
-    let elapsed = start.elapsed();
-    let done = STRESS_DONE.load(Ordering::SeqCst);
-
-    println!("\n  Completed: {}/{} goroutines", done, num_goroutines);
-    println!("  Time: {:.2?}", elapsed);
-    println!("  Memory: {} goroutines × {}KB stack = {}MB",
-        num_goroutines, STACK_SIZE / 1024,
-        (num_goroutines * STACK_SIZE) / (1024 * 1024));
-
-    assert_eq!(done, num_goroutines as u64,
-        "FAIL: only {}/{} goroutines completed!", done, num_goroutines);
-
-    println!("  ✅ All {} goroutines completed correctly!\n", num_goroutines);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    demo::run();
 }
