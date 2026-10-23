@@ -11,16 +11,16 @@
       "path": "assets/zef-assets.json"
     },
     {
-      "blake3": "0d238e0fa541c11df028916a6935533b1d2846f531e504e22ec95d906e69d30f",
+      "blake3": "70368fa726a1f0f7ccf3afa53628c1dfe086c45070aaae6100ea2e1473871908",
       "path": "exploring-go-scheduling-in-rust.html"
     }
   ],
   "posts": [
     {
       "output": "exploring-go-scheduling-in-rust.html",
-      "output_blake3": "0d238e0fa541c11df028916a6935533b1d2846f531e504e22ec95d906e69d30f",
+      "output_blake3": "70368fa726a1f0f7ccf3afa53628c1dfe086c45070aaae6100ea2e1473871908",
       "slug": "exploring-go-scheduling-in-rust",
-      "source_blake3": "7a5447b18fa4e569a861770839d9ce5703fd51a0ef44230d8f5e7f38dcd1d726",
+      "source_blake3": "7f5afb87c5f3559f4e42e7a64367038ab21cefdeec7232abbee9a7e9c8b1c9fb",
       "uid": "🍃-a979d9f673664325eb98"
     }
   ],

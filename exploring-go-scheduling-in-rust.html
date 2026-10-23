@@ -1072,11 +1072,11 @@ html[data-theme="light"] body :not(pre) > code { font-family: "SFMono-Regular", 
 <li><strong>Migrating:</strong> cooperative suspensions transfer tasks between OS workers, with exact slice and migration counts checked.</li>
 </ul>
 <p>A clean exit alone is not the test. The program checks each task&#39;s integer and selected SIMD results, FP control/status, restored condition flags, and a live value in the red zone. A workload too short to demonstrate preemption fails the preemption checks rather than claiming success. Run with <code>--trace</code> to see task progress at scheduling boundaries.</p>
-<p>On an M1 Pro, 1,000 fresh processes running the default four-mode demo passed these checks. A separate 50,000-task run on eight workers verified 500,000 migrations. These are empirical results for this bounded workload, not a proof of safety or support for arbitrary Rust tasks.</p>
+<p>On an M1 Pro, 1,000 fresh processes running the default four-mode demo passed these checks. A separate 50,000-task run on eight workers verified 500,000 migrations.</p>
 <h2>Back to the blocked executor</h2>
 <p>A Rust async executor normally gets control when a poll returns. Go has another route: an external preemption request can cause the executing thread to enter runtime code at a suitable location, preserve its state, and schedule another goroutine before the computation finishes.</p>
 <p>The interrupted thread performs the transfer. Its stack stays allocated; its live register state is saved to memory. Our demo makes the permitted interruption region explicit; Go coordinates the operation with compiler-defined safe points. In an ordinary Rust async service, long-running computations still need explicit scheduling boundaries or a separate compute pool.</p>
-<p>I like playing with code like this: pushing the limits and understanding where they are. This is a bounded demonstration, not a production executor for arbitrary Rust tasks. Whether a mechanism like this could be useful in Zef is an open question.</p>
+<p>I like playing around with highly unsafe code on this low level from time to time. Even if you never were to use this in actual production code, it teaches you the principles of the underlying system. LLMs are also an extremely helpful tool in this kind of exploration. In the pre-LLM era, just getting the code to compile and run to the point that it delivers some results was a lot harder. Now LLMs can help you to get it into a compiling state and you can iterate quickly and explore your ideas in a much easier way. For me this is a much more impressive and helpful use case of LLMs than the one-shot prompting of some slop game that you see everywhere nowadays.</p>
 <div style="height: 5rem" aria-hidden="true"></div>
 
 <hr>
