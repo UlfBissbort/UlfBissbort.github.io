@@ -1,6 +1,6 @@
 {
   "blog_uid": "🍃-8c4846916e8018b1d869",
-  "compiler_blake3": "b3ebf5863d2dbc6854154589fe2a7ad2b4cd0cbe28dedd784e075ba13110f30f",
+  "compiler_blake3": "764e85781316aa29b826534a422a2594d9b7dcc2c86697a40ec85d2a496d980a",
   "managed_files": [
     {
       "blake3": "b44b26ba418502a496245f5920325c5ba6150c3dc36f984d85d2d8c64ca9858d",
@@ -13,6 +13,10 @@
     {
       "blake3": "70368fa726a1f0f7ccf3afa53628c1dfe086c45070aaae6100ea2e1473871908",
       "path": "exploring-go-scheduling-in-rust.html"
+    },
+    {
+      "blake3": "e3fd01a4f62a05874195168fda3821db9a5d641db53c4fcca37309126eb57ef8",
+      "path": "guide-to-updating-your-mac-after-the-ca-incident.html"
     }
   ],
   "posts": [
@@ -22,6 +26,13 @@
       "slug": "exploring-go-scheduling-in-rust",
       "source_blake3": "7f5afb87c5f3559f4e42e7a64367038ab21cefdeec7232abbee9a7e9c8b1c9fb",
       "uid": "🍃-a979d9f673664325eb98"
+    },
+    {
+      "output": "guide-to-updating-your-mac-after-the-ca-incident.html",
+      "output_blake3": "e3fd01a4f62a05874195168fda3821db9a5d641db53c4fcca37309126eb57ef8",
+      "slug": "guide-to-updating-your-mac-after-the-ca-incident",
+      "source_blake3": "f97270f5935d0bcd317f31d920e6747909afa6d872c421caf1d3f1129a19d632",
+      "uid": "🍃-907a2cf5c5bdf678fe21"
     }
   ],
   "schema_version": 1,
